@@ -2,7 +2,9 @@
 
 Detects convention-based relationships (Django, FastAPI, Flask, ASP.NET, Rails,
 Laravel, Spring, Express/Nest, Angular, Gin/Echo/Chi, Axum/Actix/Rocket, TYPO3, Godot
-``class_name`` globals, pytest ``conftest.py`` and AWS Lambda handlers) and adds
+``class_name`` globals, pytest ``conftest.py``, JS/TS test-runner setup files,
+helpers a test names by path, Alembic migrations a command loads, the
+extension a VS Code extension test runs, and AWS Lambda handlers) and adds
 ``edge_type="framework"`` edges that no static import graph captures.
 
 Previously a single ``framework_edges.py`` module; split (PR 3.5) into one
@@ -18,11 +20,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from . import (
+    alembic_runner,
     android_manifest,
     angular,
     aspnet,
     aws_lambda,
     django,
+    dotnet_discovery,
+    dotnet_roots,
     express,
     fastapi,
     flask,
@@ -41,8 +46,11 @@ from . import (
     remix,
     rust,
     spring,
+    test_path_strings,
+    test_runner_setup,
     trpc,
     typo3,
+    vscode_extension,
 )
 from .base import DetectionContext, FrameworkHandler, _add_edge_if_new, read_text
 
@@ -56,10 +64,16 @@ if TYPE_CHECKING:
 # order is load-bearing because ``_add_edge_if_new`` is first-wins.
 _HANDLERS: list[FrameworkHandler] = [
     *pytest_edges.HANDLERS,  # always runs
+    *test_runner_setup.HANDLERS,
+    *test_path_strings.HANDLERS,
+    *alembic_runner.HANDLERS,
+    *vscode_extension.HANDLERS,
     *django.HANDLERS,
     *fastapi.HANDLERS,
     *flask.HANDLERS,
     *aspnet.HANDLERS,  # ASP.NET edges, then the any-C# extension-method scan
+    *dotnet_discovery.HANDLERS,  # types a .NET framework finds by assembly scan
+    *dotnet_roots.HANDLERS,
     *rails.HANDLERS,
     *laravel.HANDLERS,
     *spring.HANDLERS,

@@ -87,7 +87,7 @@ async def _index_symbol_names(root: Path) -> frozenset[str] | None:
 
     from repowise.core.persistence.crud import get_symbol_names
 
-    async with repo_index_session(root, reconcile=False) as opened:
+    async with repo_index_session(root) as opened:
         if opened is None:
             return None
         session, repo_id = opened
@@ -298,12 +298,12 @@ def _run_check(
     write_baseline_path: Path | None,
     since: str | None = None,
 ) -> None:
-    from repowise.cli.helpers import silence_logs_for_machine_output
+    from repowise.cli.helpers import silence_logs_for_machine_output_until_close
     from repowise.core.analysis.doc_drift.gate import evaluate_gate
     from repowise.core.analysis.doc_drift.live import LiveTreeError
 
     # The analyzer's debug line would land in the report a CI log shows.
-    silence_logs_for_machine_output()
+    silence_logs_for_machine_output_until_close()
     if min_confidence is not None and min_confidence > fail_on:
         ci_notices(fmt).print(
             f"[yellow]--min-confidence {min_confidence:.2f} is above --fail-on-confidence "

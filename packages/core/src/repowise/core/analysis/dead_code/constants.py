@@ -16,7 +16,8 @@ import os
 import re
 from functools import lru_cache
 
-from repowise.core.code_origin import is_vendored_or_generated_path
+from repowise.core.code_origin import is_build_file, is_vendored_or_generated_path
+from repowise.core.ingestion.languages.js_config_values import TEST_SETUP_KEYS
 from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
 
 # Non-code languages (registry passthrough languages plus "unknown").
@@ -30,6 +31,12 @@ _DEAD_CODE_EXEMPT_LANGUAGES: frozenset[str] = (
 
 # Extensions a JS tool's config file may take.
 _JS_TOOL_EXTS: tuple[str, ...] = (".js", ".cjs", ".mjs", ".ts", ".cts", ".mts")
+# A JS tool's config file: ``<tool>.config.<ext>`` and variants like
+# ``jest.config.base.js``. Never flagged itself, and a reader of what it loads.
+_JS_TOOL_CONFIG_PATTERNS: tuple[str, ...] = (
+    *(f"*.config{ext}" for ext in _JS_TOOL_EXTS),
+    *(f"*.config.*{ext}" for ext in _JS_TOOL_EXTS),
+)
 
 # Patterns that should never be flagged as dead. ``fnmatch`` ``*`` spans ``/``,
 # so a leading ``*`` matches nested and repo-root paths alike.
@@ -60,8 +67,7 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     # variants like ``jest.config.base.js``), ``.<tool>rc.<ext>`` and pnpm's
     # install hook. fnmatch ``*`` spans ``/``, so an ``*rc.<ext>`` file under a
     # dot-directory is exempt too; an accepted recall loss.
-    *(f"*.config{ext}" for ext in _JS_TOOL_EXTS),
-    *(f"*.config.*{ext}" for ext in _JS_TOOL_EXTS),
+    *_JS_TOOL_CONFIG_PATTERNS,
     *(f".*rc{ext}" for ext in _JS_TOOL_EXTS),
     *(f"*/.*rc{ext}" for ext in _JS_TOOL_EXTS),
     ".pnpmfile.cjs",
@@ -467,9 +473,7 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "submodules/**",
     "*/.deps/**",
     # ---- Rust / Cargo conventions ----------------------------------------
-    # Build scripts (executed by Cargo at compile time, never imported)
-    "**/build.rs",
-    "build.rs",
+    # Build scripts are build files (``code_origin.is_build_file``).
     # Examples (run via `cargo run --example <name>`)
     "**/examples/*.rs",
     "**/examples/**/*.rs",
@@ -516,10 +520,6 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "doc.go",
     "*/docs.go",
     "docs.go",
-    # Mage build files (``//go:build mage``, ``package main``) â€” run by the
-    # ``mage`` tool, excluded from normal builds, never imported.
-    "*/magefile.go",
-    "magefile.go",
     # Generated code (stringer, protobuf, go-bindata, ``zz_generated*``).
     "*.gen.go",
     "*_gen.go",
@@ -527,6 +527,16 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*_string.go",
     "*zz_generated*.go",
     "*bindata.go",
+    # ---- PHP conventions -------------------------------------------------
+    # Lint and refactoring tools load their config by file name.
+    "rector.php",
+    "*/rector.php",
+    "ecs.php",
+    "*/ecs.php",
+    ".php-cs-fixer.php",
+    "*/.php-cs-fixer.php",
+    ".php-cs-fixer.dist.php",
+    "*/.php-cs-fixer.dist.php",
     # ---- JavaScript conventions ------------------------------------------
     # Bundles and minified artifacts are served to the browser, not imported.
     "*.bundle.js",
@@ -580,6 +590,23 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*.stories.js",
     "*.stories.jsx",
     "*.stories.mdx",
+    # Storybook config files are loaded by path (main/preview/manager),
+    # not imported. A preview.ts outside .storybook/ stays flaggable.
+    "*.storybook/main.ts",
+    "*.storybook/main.tsx",
+    "*.storybook/main.js",
+    "*.storybook/main.jsx",
+    "*.storybook/main.mdx",
+    "*.storybook/preview.ts",
+    "*.storybook/preview.tsx",
+    "*.storybook/preview.js",
+    "*.storybook/preview.jsx",
+    "*.storybook/preview.mdx",
+    "*.storybook/manager.ts",
+    "*.storybook/manager.tsx",
+    "*.storybook/manager.js",
+    "*.storybook/manager.jsx",
+    "*.storybook/manager.mdx",
     # Benchmarks â€” invoked by vitest/tinybench/bench scripts, not imported.
     "*.bench.ts",
     "*.bench.tsx",
@@ -589,6 +616,9 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*vitest.workspace.*",
     "*vitest.shims.*",
     "*vitest.root.*",
+    # @vscode/test-cli reads its config by this name from the working directory.
+    *(f".vscode-test{ext}" for ext in _JS_TOOL_EXTS),
+    *(f"*/.vscode-test{ext}" for ext in _JS_TOOL_EXTS),
     # Codegen / generated artifacts.
     "*.gen.ts",
     "*.gen.tsx",
@@ -648,6 +678,13 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*/+layout.server.ts",
     "*/+server.ts",
     "*/+error.svelte",
+    # Astro file-based routes: every page under src/pages is a route, and a
+    # .ts/.js/.mjs file there is an endpoint (``robots.txt.ts``, ``api/[id].json.ts``).
+    "*src/pages/*.astro",
+    # shortcut: exempts src/pages/*.{ts,js,mjs} in every repo, not only Astro ones, and _-prefixed non-routes (fnmatch ``*`` crosses ``/``), gate on an Astro stack signal or filter in code if a repo reports hidden dead code.
+    "*src/pages/*.ts",
+    "*src/pages/*.js",
+    "*src/pages/*.mjs",
     # ESM declaration outputs in dist trees.
     "*/dist/*.d.ts",
     # ---- JVM (Java + Kotlin) conventions ---------------------------------
@@ -714,13 +751,9 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*OuterClass.java",  # protoc generated outer class
     "*$WrapperImpl.java",
     # ---- Dart / Flutter conventions ---------------------------------------
-    # build_runner outputs, linked from their source via ``part``.
-    "*.g.dart",
-    "*.freezed.dart",  # freezed data classes
-    "*.gr.dart",  # auto_route generated router
-    "*.config.dart",  # injectable DI config
-    "*.mocks.dart",  # mockito codegen
-    "*.gen.dart",  # flutter_gen assets
+    # build_runner outputs are generated by name in ``code_origin``. Injectable's
+    # DI config stays here only: as an origin the name is too often hand-written.
+    "*.config.dart",
     # package:test / integration_test runners execute these directly; no
     # static importer exists. ``example/`` is pub.dev's showcase convention.
     "*_test.dart",
@@ -779,6 +812,9 @@ _FRAMEWORK_DECORATORS: tuple[str, ...] = (
     "app.task",
     "celery.task",
     "shared_task",
+    # SQLAlchemy, imported bare: stored in the dialect compiler / event registry.
+    "compiles",
+    "listens_for",
     # Click CLI commands â€” registered with the parent group/command.
     "click.command",
     "click.group",
@@ -828,6 +864,10 @@ _FRAMEWORK_DECORATORS: tuple[str, ...] = (
     "Dependent",
     "Factory",
     "Bean",
+    # JMH: the harness instantiates @State classes and runs @Benchmark
+    # methods (and every @BenchmarkMode class) by reflection.
+    "Benchmark",
+    "State",
     # ---- JVM: lifecycle / event / scheduling / messaging callbacks --
     "PostConstruct",
     "PreDestroy",
@@ -852,6 +892,17 @@ _FRAMEWORK_DECORATORS: tuple[str, ...] = (
     "Modified",
     "PactTestFor",
     "Pact",
+    # Dagger / Hilt: the generated component loads modules and calls their
+    # provider methods (prefix match covers ``BindsInstance``).
+    "Module",
+    "Provides",
+    "Binds",
+    # Glide: its annotation processor generates ``GeneratedAppGlideModule``,
+    # which instantiates the annotated class. Nothing in source names it.
+    "GlideModule",
+    # Compose previews, rendered by the IDE (prefix match covers
+    # ``PreviewLightDark``, ``PreviewScreenSizes`` and the other presets).
+    "Preview",
     # ---- JVM: test method markers -----------------------------------
     "Test",
     "ParameterizedTest",
@@ -964,9 +1015,9 @@ _PURE_WRAPPER_DECORATOR_ATTRS: frozenset[str] = frozenset(
 )
 
 # Languages whose idiom is a static holder class the call site never names,
-# because it names only the member (C# extension methods). A set so widening it
-# is a deliberate act.
-_CONTAINER_USE_LANGUAGES: frozenset[str] = frozenset({"csharp"})
+# because it names only the member (C# extension methods, VB.NET Modules). A
+# set so widening it is a deliberate act.
+_CONTAINER_USE_LANGUAGES: frozenset[str] = frozenset({"csharp", "vbnet"})
 
 # Languages whose files are run, never imported: a directory holding only these
 # (a ``docker/`` folder of Dockerfiles and an entrypoint script) is not a package
@@ -974,19 +1025,14 @@ _CONTAINER_USE_LANGUAGES: frozenset[str] = frozenset({"csharp"})
 _RUN_NOT_IMPORTED_LANGUAGES: frozenset[str] = frozenset({"dockerfile", "makefile", "shell"})
 
 # Files that run, build or ship what they name by path: CI workflows, build
-# and task files, package manifests and shell scripts. A file named there is
-# executed or packaged, which is a use, not a mention.
+# files (``code_origin.is_build_file``), task files, package manifests and
+# shell scripts. A file named there is executed or packaged, which is a use,
+# not a mention.
 _RUNNER_FILE_NAMES: frozenset[str] = frozenset(
     {
-        "Makefile",
-        "makefile",
-        "GNUmakefile",
-        "Justfile",
-        "justfile",
         "Dockerfile",
         "Jenkinsfile",
         "Procfile",
-        "noxfile.py",
         "tox.ini",
         "pyproject.toml",
         "setup.cfg",
@@ -997,6 +1043,29 @@ _RUNNER_FILE_NAMES: frozenset[str] = frozenset(
 )
 _RUNNER_DIRS: tuple[str, ...] = (".github/workflows/", ".circleci/", ".buildkite/")
 _RUNNER_SUFFIXES: tuple[str, ...] = (".sh", ".bash", ".ps1", ".bat", ".cmd", ".dockerfile")
+# Tool configs that load files they name under a load key (below): the JS
+# tool configs above and the changesets config.
+_TOOL_CONFIG_PATHS: tuple[str, ...] = ("/.changeset/config.json",)
+# The keys under which a tool config names a file it loads: a test runner's
+# setup files, a bundler's entries, a docs site's sidebars, the changesets
+# changelog module. A path under any other key (``coverage.exclude``,
+# ``ignores``) or in a comment is not loaded.
+_TOOL_CONFIG_LOAD_KEYS: tuple[str, ...] = (
+    *TEST_SETUP_KEYS,
+    "entry",
+    "entryPoints",
+    "input",
+    "sidebarPath",
+    "changelog",
+)
+
+
+def is_tool_config(path: str) -> bool:
+    """Whether *path* is a tool config that loads the files its load keys name."""
+    name = path.rpartition("/")[2]
+    return any(fnmatch.fnmatchcase(name, p) for p in _JS_TOOL_CONFIG_PATTERNS) or (
+        f"/{path}".endswith(_TOOL_CONFIG_PATHS)
+    )
 
 
 def is_runner_file(path: str) -> bool:
@@ -1004,6 +1073,7 @@ def is_runner_file(path: str) -> bool:
     name = path.rpartition("/")[2]
     return (
         name in _RUNNER_FILE_NAMES
+        or is_build_file(path)
         or name.startswith("Dockerfile")
         or name.endswith(_RUNNER_SUFFIXES)
         or any(f"/{d}" in f"/{path}" for d in _RUNNER_DIRS)
@@ -1017,12 +1087,27 @@ _NAMESPACE_IMPORT_LANGUAGES: frozenset[str] = frozenset({"csharp"})
 # ``typedef struct _X {...} X`` tag used only through ``X``, a function called
 # through a ``#define`` alias or a ``##``-pasted name, an icall table entry.
 _PREPROCESSED_LANGUAGES: frozenset[str] = frozenset({"c", "cpp", "objectivec"})
+# Languages that use a type from its own package by its bare name, with no
+# import, so a symbol's name written in another code file is taken as a use.
+_BARE_NAME_USE_LANGUAGES: frozenset[str] = frozenset({"java", "kotlin", "scala"})
 
 # Annotations whose *argument* is the signal (``@SuppressWarnings("unused")``),
-# matched against the raw decorator text rather than its base name.
-_DELIBERATELY_UNUSED_ANNOTATIONS: tuple[tuple[str, str], ...] = (
-    ("SuppressWarnings", "unused"),
+# matched against the raw decorator text rather than its base name. The third
+# field asks for a whole quoted argument, case-insensitive: Kotlin writes both
+# ``unused`` and ``UNUSED``, and ``UNUSED_PARAMETER`` / ``UNUSED_VARIABLE``
+# silence a warning inside the body, not one about the declaration.
+_DELIBERATELY_UNUSED_ANNOTATIONS: tuple[tuple[str, str, bool], ...] = (
+    ("SuppressWarnings", "unused", False),
+    ("Suppress", "unused", True),
 )
+
+# Inner class names a framework reads off the class that declares them, so no
+# code ever names them. Python: the ``class Meta`` options block that Django
+# models and forms, DRF serializers, marshmallow and factory_boy read through
+# their metaclass. Keyed by language; matched only on a nested class.
+_FRAMEWORK_INNER_CLASS_NAMES: dict[str, frozenset[str]] = {
+    "python": frozenset({"Meta"}),
+}
 
 
 # Default dynamic patterns (plugins, handlers, etc.)
@@ -1079,6 +1164,11 @@ _NEVER_PACKAGE_DIRS: frozenset[str] = frozenset(
         "fuzz",
     }
 )
+
+
+# Project files that declare a .NET package. Globs, so they cannot sit in the
+# registry's exact-name manifest list (see ``ingestion/package_roots.py``).
+_PROJECT_FILE_SUFFIXES: tuple[str, ...] = (".csproj", ".fsproj", ".vbproj")
 
 
 # Path segments that indicate test fixture / sample data directories.
@@ -1186,12 +1276,13 @@ def never_flag_match(path: str) -> bool:
 
 
 def never_flag_path(path: str) -> bool:
-    """The never-flag globs, plus vendored and generated code by path.
+    """The never-flag globs, plus vendored, generated and build files by path.
 
     A copied library or a generator's output is not this repository's to
-    delete, whatever its importers look like.
+    delete, whatever its importers look like, and a build tool runs a build
+    file by its name, so it has no importer by design.
     """
-    return never_flag_match(path) or is_vendored_or_generated_path(path)
+    return never_flag_match(path) or is_vendored_or_generated_path(path) or is_build_file(path)
 
 
 def _is_fixture_path(path: str) -> bool:

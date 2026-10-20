@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from repowise.core.analysis.health.complexity.languages import NO_DIALECT_STATUS
+from repowise.server.repo_paths import missing_path_hint
+
 
 def _expand_module_targets(
     metrics: list[Any], module_targets: list[str], file_targets: list[str]
@@ -35,17 +38,26 @@ def _unresolved_targets(
     excluded_paths: set[str],
     unscored_paths: set[str],
     repo_root: Any,
-) -> list[dict[str, str]]:
+    unanalysed_paths: set[str] = frozenset(),
+) -> list[dict[str, Any]]:
     """Name every requested target that produced no rows, with a reason.
 
     Otherwise an empty ``findings`` list reads as "this file is healthy". The
     reason is actionable: ``not_indexed`` (run ``repowise update``),
     ``no_such_path`` (a typo), ``excluded`` (repo config), ``not_measured``
     (indexed, but no stored split for the ``counts`` reading; passed in so it
-    is not misreported as ``not_indexed``).
+    is not misreported as ``not_indexed``), ``language_not_supported`` (health
+    has no dialect for the file's language, so it carries no score).
     """
     out = [
-        {"target": t, "reason": _miss_reason(t, excluded_paths, unscored_paths, repo_root)}
+        {
+            "target": t,
+            **(
+                {"reason": NO_DIALECT_STATUS}
+                if t in unanalysed_paths
+                else _miss_reason(t, excluded_paths, unscored_paths, repo_root)
+            ),
+        }
         for t in file_targets
         if t not in resolved_paths
     ]
@@ -59,14 +71,17 @@ def _unresolved_targets(
 
 def _miss_reason(
     target: str, excluded_paths: set[str], unscored_paths: set[str], repo_root: Any
-) -> str:
-    """Why one file target produced no row."""
+) -> dict[str, Any]:
+    """Why one file target produced no row, plus a redirect when one is known."""
     if target in excluded_paths:
-        return "excluded"
+        return {"reason": "excluded"}
     if target in unscored_paths:
-        return "not_measured"
+        return {"reason": "not_measured"}
     try:
         on_disk = (Path(repo_root) / target).exists()
     except (OSError, ValueError):
         on_disk = False
-    return "not_indexed" if on_disk else "no_such_path"
+    if on_disk:
+        return {"reason": "not_indexed"}
+    root = str(repo_root) if repo_root else None
+    return {"reason": "no_such_path", **missing_path_hint(root, target)}

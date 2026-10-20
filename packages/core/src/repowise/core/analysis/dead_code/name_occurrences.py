@@ -45,12 +45,30 @@ where this answers it from the repository in front of us.
 
 from __future__ import annotations
 
+import posixpath
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PurePosixPath
 
-from .constants import is_runner_file
+from ...ingestion.extractors.visibility import (
+    _TS_EXPORT_ASSIGN_RE,
+    _TS_EXPORT_DEFAULT_NAME_RE,
+    _TS_EXPORT_LIST_SOURCE_RE,
+)
+from ...ingestion.languages.js_config_values import plugin_path_arguments, value_spans
+from ...ingestion.languages.registry import REGISTRY
+from ...ingestion.source_mask import can_mask, mask_source
+from .constants import (
+    _BARE_NAME_USE_LANGUAGES,
+    _NON_CODE_LANGUAGES,
+    _TOOL_CONFIG_LOAD_KEYS,
+    is_runner_file,
+    is_tool_config,
+)
+from .entry_shape import export_shape
+from .jvm_name_scope import JvmNameScope
 from .models import DeadCodeFindingData, DeadCodeKind
 from .risk_factors import RISK_CAP_CONFIDENCE
 
@@ -94,6 +112,8 @@ class _Answer(Enum):
 class _Verdict:
     answer: _Answer
     used_at: str | None = None
+    # ``used_at`` is a code file, not documentation or config.
+    in_code: bool = False
 
 
 _NOT_SEARCHABLE = _Verdict(_Answer.NOT_SEARCHABLE)
@@ -162,7 +182,7 @@ def _uses_in_own_file(
     wanted: dict[bytes, list[DeadCodeFindingData]] = {}
     headers: dict[bytes, set[int]] = {}
     for finding in spanned:
-        token = _token(finding.symbol_name)
+        token = searchable_token(finding.symbol_name)
         wanted.setdefault(token, []).append(finding)
         headers.setdefault(token, set()).add(finding.start_line)
 
@@ -176,11 +196,94 @@ def _uses_in_own_file(
                     continue
                 if lineno in headers[token]:
                     continue  # a sibling declaration of the same name
-                out[id(finding)] = _Verdict(_Answer.USED, f"{path}:{lineno}")
+                out[id(finding)] = _Verdict(_Answer.USED, f"{path}:{lineno}", in_code=True)
     return out
 
 
-def _token(name: str) -> bytes:
+def demote_used_in_own_file(
+    findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
+) -> None:
+    """Mark *findings* whose name their own file writes outside their span export-only.
+
+    For an unused export: a use beside it (a request type its endpoint takes,
+    a constant the function below reads) means it is used and at most
+    exported wider than it needs to be. Kept below the review floor with the
+    line that uses it, never deletion-ready, rather than dropped, since a
+    same-file use by a symbol that is itself dead keeps it alive. Mutates in
+    place.
+    """
+    by_file: dict[str, list[DeadCodeFindingData]] = {}
+    for finding in findings:
+        # Already marked by another reading of the same file: one verdict, one line.
+        if finding.symbol_name and finding.file_path in source_map and not finding.export_only:
+            by_file.setdefault(finding.file_path, []).append(finding)
+    for path, pending in by_file.items():
+        verdicts = _uses_in_own_file(source_map, path, pending)
+        for finding in pending:
+            verdict = verdicts[id(finding)]
+            if verdict.answer is _Answer.USED:
+                _mark_export_only(finding, verdict.used_at)
+
+
+def _mark_export_only(finding: DeadCodeFindingData, used_at: str | None) -> None:
+    finding.export_only = True
+    finding.confidence = min(finding.confidence, UNVERIFIED_INTERNAL_CONFIDENCE)
+    finding.safe_to_delete = False
+    finding.reason = f"'{finding.symbol_name}' is used in its own file; only its export is unused"
+    finding.evidence.append(f"Used in its own file at {used_at}; at most it need not be public")
+
+
+def demote_exports_used_in_own_code(
+    findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
+) -> list[DeadCodeFindingData]:
+    """:func:`demote_used_in_own_file` for Python and JS-family unused exports.
+
+    Read with comments and string bodies blanked, so a name listed in
+    ``__all__`` or mentioned in a docstring is not a use, while a template
+    literal's ``${NAME}`` still is. A JS/TS export clause (``export { X }``,
+    ``export default X``) only publishes the name, so it is blanked too.
+    Ceiling: a Python f-string's ``{NAME}`` is blanked as well, so such a use
+    is missed and the finding stays as it was.
+    Other languages are left to :func:`clamp_unverified_absence`. Each file is
+    masked once. Returns the same list.
+    """
+    exports = [
+        f
+        for f in findings
+        if f.kind is DeadCodeKind.UNUSED_EXPORT
+        and f.file_path in source_map
+        and can_mask(PurePosixPath(f.file_path).suffix)
+    ]
+    masked = {path: _own_code(path, source_map[path]) for path in {f.file_path for f in exports}}
+    demote_used_in_own_file(exports, masked)
+    return findings
+
+
+#: Statements that only publish a name the file declares, never use it.
+_EXPORT_CLAUSES = (_TS_EXPORT_LIST_SOURCE_RE, _TS_EXPORT_DEFAULT_NAME_RE, _TS_EXPORT_ASSIGN_RE)
+
+
+def _own_code(path: str, blob: bytes) -> bytes:
+    """*blob*'s code with comments, string bodies and JS/TS export clauses blanked.
+
+    Lines are kept, so a match still reports its real line number.
+    """
+    suffix = PurePosixPath(path).suffix
+    text = mask_source(blob.decode("utf-8", "replace"), suffix, strings=True)
+    if suffix.lower() != ".py":
+        for clause in _EXPORT_CLAUSES:
+            text = clause.sub(_blank, text)
+    return text.encode("utf-8")
+
+
+def _blank(match: re.Match[str]) -> str:
+    return _NOT_NEWLINE.sub(" ", match.group())
+
+
+_NOT_NEWLINE = re.compile(r"[^\n]")
+
+
+def searchable_token(name: str) -> bytes:
     """The searchable form of *name*, or empty when the scan cannot find it.
 
     The one rule is that the result must be something :data:`IDENTIFIER_RE`
@@ -223,13 +326,44 @@ def _is_own_type_sibling(occurrence: str, declaring: str) -> bool:
     return stem == base
 
 
+def _used_in(paths: list[str]) -> _Verdict:
+    """A use in *paths*, preferring a code file to a doc or config."""
+    in_code = [path for path in paths if _language(path) not in _NON_CODE_LANGUAGES]
+    return _Verdict(_Answer.USED, (in_code or paths)[0], in_code=bool(in_code))
+
+
+def _uses_elsewhere(
+    finding: DeadCodeFindingData, files: set[str], scope: JvmNameScope | None
+) -> list[str]:
+    """The files other than *finding*'s own whose mention of its name is a use.
+
+    With *scope*, only the first such file is returned, code files first: one
+    is all :func:`_used_in` needs, and a common name has hundreds of writers.
+    """
+    declaring = finding.file_path
+    others = sorted(f for f in files - {declaring} if not _is_own_type_sibling(f, declaring))
+    if scope is None:
+        return others
+    others.sort(key=lambda path: _language(path) in _NON_CODE_LANGUAGES)
+    first = next(
+        (f for f in others if scope.can_refer(finding.symbol_name, declaring, files, f)), None
+    )
+    return [first] if first is not None else []
+
+
 def _verdicts(
-    source_map: dict[str, bytes], candidates: list[DeadCodeFindingData]
+    source_map: dict[str, bytes],
+    candidates: list[DeadCodeFindingData],
+    scope: JvmNameScope | None = None,
 ) -> dict[int, _Verdict]:
-    """One verdict per candidate, from one repo-wide scan plus targeted reads."""
+    """One verdict per candidate, from one repo-wide scan plus targeted reads.
+
+    With *scope*, another file's mention counts only when its bare name can
+    refer to the candidate's own class.
+    """
     # Built from the candidates alone, which is what keeps a whole-repo scan
     # affordable: the index only ever holds the names some finding asks about.
-    answerable = {_token(f.symbol_name) for f in candidates} - {b""}
+    answerable = {searchable_token(f.symbol_name) for f in candidates} - {b""}
     occurrences = occurrence_files(source_map, answerable)
 
     out: dict[int, _Verdict] = {}
@@ -240,18 +374,14 @@ def _verdicts(
     same_file_only: dict[str, list[DeadCodeFindingData]] = {}
 
     for finding in candidates:
-        token = _token(finding.symbol_name)
+        token = searchable_token(finding.symbol_name)
         if not token:
             out[id(finding)] = _NOT_SEARCHABLE
             continue
         files = occurrences.get(token, set())
-        elsewhere = sorted(
-            f
-            for f in files - {finding.file_path}
-            if not _is_own_type_sibling(f, finding.file_path)
-        )
+        elsewhere = _uses_elsewhere(finding, files, scope)
         if elsewhere:
-            out[id(finding)] = _Verdict(_Answer.USED, elsewhere[0])
+            out[id(finding)] = _used_in(elsewhere)
         elif finding.file_path in files:
             same_file_only.setdefault(finding.file_path, []).append(finding)
         else:
@@ -329,6 +459,41 @@ def clamp_unverified_absence(
     return findings
 
 
+def _language(path: str) -> str | None:
+    return REGISTRY.from_extension(PurePosixPath(path).suffix)
+
+
+def drop_bare_name_uses(
+    findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
+) -> list[DeadCodeFindingData]:
+    """Drop unused exports whose name another code file, or their own, writes.
+
+    For a language that uses a type from its own package by its bare name (a
+    Java class, a nested type used further down its own file), the name
+    written in code outside the declaration is the use the import graph
+    cannot see, so the finding is wrong rather than doubtful. A mention only
+    in documentation or config is left to :func:`clamp_unverified_absence`.
+    A mention whose name means another type there (a same-named nested type,
+    a generated message class) is not a use; see :mod:`.jvm_name_scope`.
+    Returns a new list.
+    """
+    candidates = [f for f in findings if _uses_bare_names(f)]
+    if not candidates or not source_map:
+        return findings
+    verdicts = _verdicts(source_map, candidates, JvmNameScope(source_map))
+    used = {key for key, verdict in verdicts.items() if verdict.in_code}
+    return [f for f in findings if id(f) not in used]
+
+
+def _uses_bare_names(finding: DeadCodeFindingData) -> bool:
+    """An unused export in a language that uses a type by its bare name."""
+    return (
+        finding.kind is DeadCodeKind.UNUSED_EXPORT
+        and bool(finding.symbol_name)
+        and _language(finding.file_path) in _BARE_NAME_USE_LANGUAGES
+    )
+
+
 def drop_internals_used_in_own_file(
     findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
 ) -> list[DeadCodeFindingData]:
@@ -372,7 +537,7 @@ def drop_internals_used_in_own_file(
         if verdict is not None:
             if verdict.answer is _Answer.USED:
                 continue
-            if verdict.answer is _Answer.SPAN_UNKNOWN or not _token(finding.symbol_name):
+            if verdict.answer is _Answer.SPAN_UNKNOWN or not searchable_token(finding.symbol_name):
                 finding.confidence = min(finding.confidence, UNVERIFIED_INTERNAL_CONFIDENCE)
                 finding.evidence.append(
                     f"'{finding.symbol_name}' could not be checked against the rest of "
@@ -444,26 +609,47 @@ def _files_naming(targets: set[str], source_map: dict[str, bytes]) -> dict[str, 
 
     named_in: dict[str, list[str]] = {}
     for path, blob in sorted(source_map.items()):
-        for target in _targets_in(blob, wanted, tails) - {path}:
+        base = path.rpartition("/")[0]
+        for target in _targets_in(blob, wanted, tails, base) - {path}:
             named_in.setdefault(target, []).append(path)
     return named_in
 
 
-def _targets_in(blob: bytes, wanted: dict[str, set[str]], tails: set[str]) -> set[str]:
-    """The targets any path-shaped token of *blob* names."""
+def _targets_in(
+    blob: bytes, wanted: dict[str, set[str]], tails: set[str], base: str
+) -> set[str]:
+    """The targets any path-shaped token of *blob*, a file in *base*, names."""
     return {
         target
         for match in _PATH_TOKEN_RE.finditer(blob)
-        for target in _targets_named_by(match.group().decode("ascii"), wanted, tails)
+        for target in _targets_named_by(match.group().decode("ascii"), wanted, tails, base)
     }
 
 
-def _targets_named_by(token: str, wanted: dict[str, set[str]], tails: set[str]) -> set[str]:
-    """The targets one path-shaped *token* names, through any of its spellings."""
+def _targets_named_by(
+    token: str, wanted: dict[str, set[str]], tails: set[str], base: str
+) -> set[str]:
+    """The targets one path-shaped *token* names, through any of its spellings.
+
+    A tool resolves a relative path against the directory of the file that
+    writes it (``setupFiles: ["./vitest.setup.ts"]`` in ``src/vitest.config.ts``
+    is ``src/vitest.setup.ts``), so that resolution is one more spelling.
+    """
     tail = token.strip(".").rpartition("/")[2]
     if tail not in tails and tail.rpartition(".")[0] not in tails:
         return set()
-    return {target for spelling in _token_spellings(token) for target in wanted.get(spelling, ())}
+    spellings = _token_spellings(token)
+    if base and not token.startswith("/"):
+        # Not through ``_token_spellings``: its dot strip would eat the
+        # leading dot of a dot-directory (``.changeset/``).
+        resolved = posixpath.normpath(f"{base}/{token}")
+        spellings += [resolved, resolved.rpartition(".")[0]]
+    return {target for spelling in spellings for target in wanted.get(spelling, ())}
+
+
+#: What a file named by path can be used as: a file a runner loads, or a module
+#: whose exports a tool config reads.
+_PATH_LOADED_KINDS = frozenset({DeadCodeKind.UNREACHABLE_FILE, DeadCodeKind.UNUSED_EXPORT})
 
 
 def clamp_path_mentions(
@@ -478,25 +664,72 @@ def clamp_path_mentions(
     A mention in a doc is not proof of use, so that finding is capped to the
     review tier. A CI workflow, build file, manifest or shell script runs or
     ships what it names (``python scripts/emit_sample_dsl.py`` in a workflow),
-    so a file one of those names is dropped.
+    so a file one of those names is dropped. A tool config that loads a module
+    reads what the module exports by default (a changesets changelog module,
+    a docs site's sidebars), so the unused exports of a default-exporting
+    module a tool config names are dropped too; a setup file the config runs
+    for its side effects keeps them.
 
     One scan over the indexed source. That already holds JSON, YAML, Markdown,
     shell and ``package.json``: each has a language spec, so ingestion reads
     it. A file's mention of itself is not a use. Returns a new list; never
     raises a confidence.
     """
-    unreachable = [f for f in findings if f.kind is DeadCodeKind.UNREACHABLE_FILE]
-    if not source_map or not unreachable:
+    in_scope = [f for f in findings if f.kind in _PATH_LOADED_KINDS]
+    if not source_map or not in_scope:
         return findings
 
-    named_in = _files_naming({f.file_path for f in unreachable}, source_map)
-    run = {
-        id(f) for f in unreachable if any(map(is_runner_file, named_in.get(f.file_path, ())))
-    }
-    for finding in unreachable:
-        if id(finding) not in run:
+    named_in = _files_naming({f.file_path for f in in_scope}, source_map)
+    loads = _ConfigLoads(source_map)
+    run = {id(f) for f in in_scope if _loaded(f, named_in.get(f.file_path, ()), loads)}
+    kept = [f for f in findings if id(f) not in run]
+    for finding in kept:
+        if finding.kind is DeadCodeKind.UNREACHABLE_FILE:
             _cap_named_by_path(finding, named_in.get(finding.file_path))
-    return [f for f in findings if id(f) not in run]
+    return kept
+
+
+def _loaded(finding: DeadCodeFindingData, namers: Iterable[str], loads: _ConfigLoads) -> bool:
+    """Whether *namers* load the file of *finding* in the way the finding denies.
+
+    A tool config is read only through its load keys and plugin path
+    arguments, even when it is also a
+    runner by name (a bundler config is a build file): a path it mentions in a
+    comment or an ignore list is not loaded.
+    """
+    path = finding.file_path
+    configs = [n for n in namers if is_tool_config(n)]
+    loaders = [n for n in configs if loads.loads(n, path)]
+    if finding.kind is DeadCodeKind.UNREACHABLE_FILE:
+        others = (n for n in namers if n not in configs)
+        return bool(loaders) or any(map(is_runner_file, others))
+    source = loads.source_map.get(path)
+    return bool(loaders) and "default" in export_shape(path, frozenset(), source)
+
+
+@dataclass
+class _ConfigLoads:
+    """What each tool config loads, read once per config for the whole pass."""
+
+    source_map: dict[str, bytes]
+    _values: dict[str, bytes] = field(default_factory=dict)
+
+    def loads(self, config: str, target: str) -> bool:
+        """Whether *config* names *target* under a load key or as a plugin's path."""
+        wanted = {key: {target} for key in _path_keys(target)}
+        tails = {key.rpartition("/")[2] for key in wanted}
+        base = config.rpartition("/")[0]
+        return target in _targets_in(self._load_values(config), wanted, tails, base)
+
+    def _load_values(self, config: str) -> bytes:
+        if config not in self._values:
+            text = self.source_map.get(config, b"")
+            # Re-quoted so _targets_in reads each as the one path token it is;
+            # a bare word argument is a name, not a file, so it needs a "/".
+            paths = [f'"{s}"'.encode() for s in plugin_path_arguments(text) if "/" in s]
+            spans = value_spans(text, _TOOL_CONFIG_LOAD_KEYS)
+            self._values[config] = b"\n".join([*spans, *paths])
+        return self._values[config]
 
 
 def _cap_named_by_path(finding: DeadCodeFindingData, namers: list[str] | None) -> None:
@@ -515,7 +748,7 @@ def _writers(
     source_map: dict[str, bytes], names: Mapping[int, frozenset[str]]
 ) -> dict[bytes, set[str]]:
     """For every searchable name in *names*, the files of *source_map* writing it."""
-    tokens = {_token(name) for group in names.values() for name in group} - {b""}
+    tokens = {searchable_token(name) for group in names.values() for name in group} - {b""}
     return occurrence_files(source_map, tokens)
 
 
@@ -543,7 +776,7 @@ def drop_reference_assembly_api(
     return [
         f
         for f in findings
-        if not any(_token(name) in listed for name in names.get(id(f), ()))
+        if not any(searchable_token(name) in listed for name in names.get(id(f), ()))
     ]
 
 
@@ -591,7 +824,7 @@ def _first_writer(
         (
             (path, name)
             for name in names
-            for path in writers.get(_token(name), ())
+            for path in writers.get(searchable_token(name), ())
             if path != file_path and not _is_own_type_sibling(path, file_path)
         ),
         default=None,

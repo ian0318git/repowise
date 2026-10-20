@@ -7,7 +7,10 @@ nearest case where it must not.
 
 from __future__ import annotations
 
-from repowise.core.analysis.health.fix_first import build_fix_first
+import re
+
+from repowise.core.analysis.health.fix_first import build_fix_first, text
+from repowise.core.analysis.health.worth import SIZE_MARKERS
 from tests.unit.health.fix_first_rows import FINDINGS, METRICS
 
 _COMPLEX = FINDINGS[1]  # run in src/core.py: CCN 14, 50 lines, nests 4 deep
@@ -63,6 +66,17 @@ def test_test_origin_is_kept_under_scope_all() -> None:
 def test_a_vendored_directory_counts_as_vendored() -> None:
     queue = _queue([_finding("lib/vendor/x.py")])
     assert queue.totals.excluded["vendored"] == 1
+
+
+def test_a_build_file_counts_as_tooling_by_stored_origin_or_by_path() -> None:
+    stored = _queue([_finding("src/a.py")], [_metric("src/a.py", code_origin="build")])
+    assert stored.items == () and stored.totals.excluded["tooling"] == 1
+    # An index stored before build files were classed says production; the
+    # path still decides.
+    path = "ktor-server/build.gradle.kts"
+    old = _queue([_finding(path)], [_metric(path, code_origin="production")])
+    assert old.items == () and old.totals.excluded["tooling"] == 1
+    assert len(_queue([_finding("src/build_info.py")]).items) == 1
 
 
 def test_a_deprecated_function_is_no_item() -> None:
@@ -239,6 +253,15 @@ def test_break_cycle_needs_the_import_line() -> None:
     assert lined.lead.action.steps[0].text == "Cut the import of b.py in a.py (line 7)"
 
 
+def test_an_idiomatic_cycle_is_never_a_cut_to_make() -> None:
+    edges = [{"from": "src/a.py", "to": "src/b.py", "line": 7}]
+    plan = {"cut_edges": edges, "idiom": "same_directory"}
+    assert _refactor_queue("break_cycle", plan).totals.excluded["no_concrete_step"] == 1
+    text = _step_text("break_cycle", plan)
+    assert text.startswith("Optional:") and "idiomatic" in text
+    assert "Cut the import" not in text
+
+
 def test_split_file_needs_named_groups() -> None:
     unnamed = {"groups": [{"symbols": ["a", "b"]}]}
     assert _refactor_queue("split_file", unnamed).totals.excluded["no_concrete_step"] == 1
@@ -271,39 +294,51 @@ def _perf_queue(*rows):
 
 def test_string_concat_needs_a_loop_that_grows() -> None:
     assert len(_perf_queue(_concat()).items) == 1
-    for magnitude in ("bounded", "unknown"):
+    for magnitude, reason in (("bounded", "unconfirmed_cost"), ("unknown", "unmeasured_cost")):
         queue = _perf_queue(_concat(loop_magnitude=magnitude))
-        assert queue.items == () and queue.totals.excluded["below_min_worth"] == 1
+        assert queue.items == () and queue.totals.excluded[reason] == 1
 
 
-def test_other_causes_keep_an_unknown_loop() -> None:
+# --- F8: only a cause we are sure of is an item --------------------------------------
+
+_GROWS = {"loop_magnitude": "grows_with_data", "growth_source": "loop"}
+
+
+def _row(role: str, facets: dict) -> dict:
     from tests.unit.health.fix_first_rows import _perf
 
-    row = _perf("perf3_db", "src/db.py::fetch")
-    row["details"] = {**row["details"], "facets": {"loop_magnitude": "unknown"}}
-    assert len(_perf_queue(row).items) == 1
-
-
-# --- F8: unknown loops no entry point reaches -----------------------------------
-
-
-def _value(**facets) -> str:
-    from tests.unit.health.fix_first_rows import _perf
-
-    row = _perf("perf3_v", "src/db.py::fetch")
+    row = _perf("perf3_v", "src/db.py::fetch", execution_role=role)
     row["details"] = {**row["details"], "facets": facets}
-    item = _perf_queue(row).lead
-    return next(f.value for f in item.why_ranked if f.factor == "value")
+    return row
 
 
-def test_an_unknown_loop_no_entry_reaches_drops_a_step() -> None:
-    assert _value(loop_magnitude="unknown", exposure="not_entry_reachable") == "1"
-    assert _value(loop_magnitude="unknown") == "1"
+def _value(role: str = "unknown", **facets) -> str:
+    item = _perf_queue(_row(role, facets)).lead
+    return next(f.value for f in item.why_ranked if f.factor in ("value", "value within later"))
 
 
-def test_reach_or_a_known_loop_keeps_the_step() -> None:
-    assert _value(loop_magnitude="unknown", exposure="entry_reachable") == "2"
-    assert _value(loop_magnitude="grows_with_data", exposure="not_entry_reachable") == "2"
+def _excluded(role: str = "unknown", **facets) -> dict:
+    queue = _perf_queue(_row(role, facets))
+    assert queue.items == ()
+    return {k: n for k, n in queue.totals.excluded.items() if n}
+
+
+def test_an_unmeasured_loop_is_never_an_item() -> None:
+    for role in ("request", "unknown"):
+        for reach in ("entry_reachable", "unknown"):
+            assert _excluded(role, loop_magnitude="unknown", exposure=reach) == {
+                "unmeasured_cost": 1
+            }
+
+
+def test_growth_only_a_registry_or_a_migration_shows_is_never_an_item() -> None:
+    for source in ("registry", "cold_path", None):
+        facets = {**_GROWS, "growth_source": source, "exposure": "entry_reachable"}
+        assert _excluded("request", **facets) == {"unconfirmed_cost": 1}
+
+
+def test_only_a_loop_known_to_grow_leads() -> None:
+    assert _perf_queue(_row("request", _GROWS)).lead.tier != "later"
 
 
 # --- lift: a duplicate inside the function ---------------------------------------
@@ -316,9 +351,11 @@ def _ranked(item, factor: str) -> str:
 def test_a_duplicate_inside_lifts_a_complexity_unit_one_step() -> None:
     plain = _queue([_finding()]).lead
     lifted = _queue([_finding()], plans=[_helper()]).lead
-    assert int(_ranked(lifted, "value")) == int(_ranked(plain, "value")) + 1
+    # CCN 14 is near the bar, so both are later; the lift still orders them.
+    value = "value within later"
+    assert int(_ranked(lifted, value)) == int(_ranked(plain, value)) + 1
     assert _ranked(lifted, "duplicate inside") == "yes"
-    assert "duplicated" in lifted.why and "duplicated" not in plain.why
+    assert text.CLONED in lifted.why and text.CLONED not in plain.why
 
 
 def test_a_duplicate_elsewhere_in_the_file_does_not_lift() -> None:
@@ -381,9 +418,22 @@ def test_why_says_why_it_matters_not_the_titles_size() -> None:
     assert item.title == "Break up run (CCN 249, 1,280 lines)"
     assert "249" not in item.why and "1,280" not in item.why and "CCN" not in item.why
     assert item.why == (
-        "run has many independent paths through it; 9 files import it, "
-        "changed 12 times in 90 days."
+        "run has many paths; easier to read and change once split; "
+        "its file is imported by 9 files, changed 12 times in 90 days."
     )
+
+
+def test_break_up_why_says_what_the_split_buys_not_defects() -> None:
+    """A split is a readability and change-cost claim: every phrase a Break up
+    why can carry says what improves and names no defect."""
+    defect = re.compile(r"bug|defect|fail|error|risk", re.IGNORECASE)
+    phrases = [text.PROBLEM[m] for m in sorted(SIZE_MARKERS)] + [text.PROBLEM["god_class"]]
+    for phrase in [*phrases, text.CLONED]:
+        assert not defect.search(phrase), phrase
+    assert all(phrase.endswith(text.SPLIT_GAIN) for phrase in phrases)
+    item = _queue([_finding(ccn=249, nloc=1280, max_nesting=7)]).lead
+    assert item.title.startswith("Break up run")
+    assert not defect.search(f"{item.title} {item.why}")
 
 
 def test_why_names_coverage_when_a_report_measured_it() -> None:
@@ -442,9 +492,14 @@ def test_a_module_scope_cause_reads_module_scope_of_its_file() -> None:
 
 
 def test_a_production_reachable_growing_db_loop_is_in_the_top_band() -> None:
-    from repowise.core.analysis.health.fix_first.build import VALUE_MAX
+    from repowise.core.analysis.health.queue.value import VALUE_MAX
 
-    assert _value(loop_magnitude="grows_with_data", exposure="entry_reachable") == str(VALUE_MAX)
+    # Request or message, then a scheduled job, then no role evidence but a
+    # reaching entry point; a cold role is never an item.
+    assert _value("request", **_GROWS) == _value("event_consumer", **_GROWS) == str(VALUE_MAX)
+    assert _value("scheduled_job", **_GROWS) == "3"
+    assert _value("unknown", **_GROWS, exposure="entry_reachable") == "2"
+    assert _excluded("cli", **_GROWS) == {"cold_role": 1}
 
 
 def test_it_outranks_a_large_function_that_needs_judgment_on_score() -> None:
@@ -459,8 +514,8 @@ def test_it_outranks_a_large_function_that_needs_judgment_on_score() -> None:
     assert {i.kind for i in queue.items[:2]} == {"finding", "perf_fix"}
 
 
-def test_without_reach_it_stays_below_the_top_band() -> None:
-    assert _value(loop_magnitude="grows_with_data", exposure="not_entry_reachable") == "2"
+def test_with_no_role_and_no_reach_it_is_no_item() -> None:
+    assert _excluded(**_GROWS, exposure="not_entry_reachable") == {"unconfirmed_cost": 1}
 
 
 # --- titles and steps name what they mean -----------------------------------------
@@ -486,11 +541,13 @@ def test_a_one_line_block_reads_as_one_line() -> None:
 # --- kinds the baseline raters found not worth doing -------------------------------
 
 
-def test_extract_class_and_move_method_plans_are_low_value() -> None:
+def test_extract_class_and_move_method_plans_wait_for_their_audit() -> None:
     plan = {"groups": [{"methods": ["load", "save"], "fields": ["db"]}]}
-    assert _refactor_queue("extract_class", plan).totals.excluded["low_value_kind"] == 1
+    split = _refactor_queue("extract_class", plan)
+    assert split.items == () and split.totals.excluded["kind_unaudited"] == 1
     moved = _refactor_queue("move_method", {"to_class": "Ledger"})
-    assert moved.items == () and moved.totals.excluded["low_value_kind"] == 1
+    assert moved.items == () and moved.totals.excluded["kind_unaudited"] == 1
+    assert moved.totals.excluded["low_value_kind"] == 0
 
 
 def test_large_method_and_low_cohesion_findings_are_low_value() -> None:
@@ -503,3 +560,37 @@ def test_a_split_file_plan_and_a_complex_method_stay() -> None:
     named = {"groups": [{"name": "io", "symbols": ["read"]}]}
     assert len(_refactor_queue("split_file", named).items) == 1
     assert len(_queue([_finding()]).items) == 1
+
+
+def test_a_rust_panic_path_is_no_fix_first_candidate() -> None:
+    """An unwrap or panic is a crash path, not a failure the handler hides."""
+    rows = [
+        {**_finding(f"src/{kind}.rs"), "biomarker_type": "error_handling", "line_start": 9,
+         "details": {"kind": kind}}
+        for kind in ("unsafe_unwrap", "panic_macro")
+    ]
+    queue = _queue(rows)
+    assert queue.items == () and queue.totals.excluded["low_value_kind"] == 2
+    swallowed = {**rows[0], "file_path": "src/a.py", "details": {"kind": "swallowed_catch"}}
+    assert [i.target.file_path for i in _queue([swallowed]).items] == ["src/a.py"]
+
+
+def test_a_perf_step_names_its_function_unless_the_action_already_does() -> None:
+    from repowise.core.analysis.health.fix_first.build import _perf_step_text
+
+    quoted = {"action": "Batch the per-row session.get calls", "symbol": "src/db.py::Store.get"}
+    assert _perf_step_text(quoted, "src/db.py") == f"{quoted['action']} (Store.get)"
+    named = {"action": "Pass every key to get at once", "symbol": "src/db.py::Store.get"}
+    assert _perf_step_text(named, "src/db.py") == named["action"]
+
+
+def test_a_span_that_awaits_is_extracted_into_an_awaited_async_helper() -> None:
+    from repowise.core.analysis.health.fix_first import text
+
+    assert text.signature("load_rows", ["db"], ["rows"]) == "load_rows(db) -> rows"
+    assert text.signature("load_rows", ["db"], ["rows"], is_async=True) == (
+        "async load_rows(db) -> rows, awaited at the call site"
+    )
+    assert text.signature(None, ["db"], [], is_async=True) == (
+        "async <name>(db), awaited at the call site; name it for what the lines do"
+    )

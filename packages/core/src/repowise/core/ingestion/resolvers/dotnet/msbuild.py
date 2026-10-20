@@ -68,11 +68,32 @@ class MSBuildProject:
     #: same as an explicit <IsPackable>false</IsPackable>.
     is_packable: bool | None = None
     generate_package_on_build: bool = False
+    #: A literal ``<IsTestProject>true</IsTestProject>`` outside any
+    #: ``Condition``, or the MSTest SDK, which sets it.
+    is_test_project: bool = False
+    #: The ``package_references`` declared outside any ``Condition``: a shared
+    #: build file that adds test packages only ``Condition="'$(IsTestProject)'
+    #: == 'true'"`` does not make every project below it a test project.
+    unconditional_package_references: set[str] = field(default_factory=set)
 
     @property
     def name(self) -> str:
         """Display name — the .csproj filename without extension."""
         return self.path.stem
+
+    @property
+    def published_id(self) -> str | None:
+        """The id this project publishes a package under, or None when it does not.
+
+        Packability is opt-in, never assumed: an SDK-style project is packable
+        by default, so treating silence as yes would make every internal
+        project in a solution a published library.
+        """
+        if self.is_packable is False:
+            return None
+        if not (self.is_packable or self.generate_package_on_build or self.package_id is not None):
+            return None
+        return self.package_id or self.assembly_name or self.path.stem
 
 
 # Strip XML namespace prefix from a tag — MSBuild docs say the namespace
@@ -105,6 +126,16 @@ def _compile_items(include: str | None) -> list[str]:
     return [item for item in items if item and "*" not in item]
 
 
+def _conditioned(root: ET.Element) -> set[int]:
+    """Ids of the elements a ``Condition`` applies to, itself or an ancestor's."""
+    return {
+        id(element)
+        for scope in root.iter()
+        if scope.get("Condition") is not None
+        for element in scope.iter()
+    }
+
+
 def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
     """Parse a single .csproj file. Returns None on parse failure."""
     try:
@@ -115,6 +146,8 @@ def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
 
     project = MSBuildProject(path=csproj_path.resolve(), project_dir=csproj_path.parent.resolve())
     root = tree.getroot()
+    project.is_test_project = "mstest.sdk" in (root.get("Sdk") or "").lower()
+    conditioned = _conditioned(root)
 
     for elem in root.iter():
         tag = _local(elem.tag)
@@ -134,6 +167,8 @@ def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
                 project.is_packable = packable
         elif tag == "GeneratePackageOnBuild" and elem.text:
             project.generate_package_on_build = _bool(elem.text)
+        elif tag == "IsTestProject" and elem.text and id(elem) not in conditioned:
+            project.is_test_project = _bool(elem.text)
         elif tag == "ProjectReference":
             include = elem.get("Include")
             if include:
@@ -148,6 +183,8 @@ def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
             pkg = elem.get("Include")
             if pkg:
                 project.package_references.add(pkg.strip())
+                if id(elem) not in conditioned:
+                    project.unconditional_package_references.add(pkg.strip())
         elif tag in ("Using", "Import"):
             # <Using Include="X"/> is the C# form, <Import Include="X"/> the VB
             # one; MSBuild's own <Import Project="..."/> carries no Include.

@@ -16,12 +16,17 @@ reads the tree with it.
 - **typed / scalar parameters**: how many parameters declare a type, and how
   many of those are a scalar or a string. An untyped parameter is in neither
   count.
+- **bound parameters**: parameters whose own annotation says a framework fills
+  them (``@PathVariable``), read the same way as a declaration's markers. They
+  stay in the declared count and leave the typed and scalar ones.
 """
 
 from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
+
+from .ast_utils import _parameter_nodes
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -59,7 +64,7 @@ _TYPE_PUNCT_RE = re.compile(r"[*&?|\[\]]|'\w+")
 # Nodes of a parameter list that are not parameters, as ``_count_parameters``
 # skips them.
 _NON_PARAMS = frozenset(
-    {"comment", "keyword_separator", "positional_separator", "self_parameter"}
+    {"keyword_separator", "positional_separator", "self_parameter"}
 )
 
 
@@ -74,6 +79,10 @@ def _marker_words(node: Node) -> set[str]:
     declarator = node.child_by_field_name("declarator")
     if declarator is not None:
         stack += [c for c in declarator.children if c.type in _MARKER_CONTAINERS]
+    return _leaf_words(stack)
+
+
+def _leaf_words(stack: list[Node]) -> set[str]:
     words: set[str] = set()
     while stack:
         cur = stack.pop()
@@ -113,13 +122,19 @@ def is_constructor(fn_node: Node, name: str, lmap: LanguageNodeMap) -> bool:
     return name == _enclosing_type_name(fn_node)
 
 
+def is_trait_impl(node: Node, lmap: LanguageNodeMap) -> bool:
+    """Whether *node* implements a trait (Rust ``impl Trait for T``): its
+    members are the trait's, not its own."""
+    return node.type in lmap.trait_impl_kinds and node.child_by_field_name("trait") is not None
+
+
 def _in_trait_impl(fn_node: Node, lmap: LanguageNodeMap) -> bool:
     node = fn_node.parent
     while node is not None and node.type not in lmap.trait_impl_kinds:
         if node.type in lmap.function_kinds:
             return False
         node = node.parent
-    return node is not None and node.child_by_field_name("trait") is not None
+    return node is not None and is_trait_impl(node, lmap)
 
 
 def _is_published(node: Node, lmap: LanguageNodeMap) -> bool:
@@ -186,11 +201,33 @@ def typed_param_counts(params: Node | None, lmap: LanguageNodeMap) -> tuple[int,
     typed = scalar = 0
     if not lmap.scalar_type_names or params is None:
         return typed, scalar
-    for param in params.named_children:
+    for param in _parameter_nodes(params):
         if param.type in _NON_PARAMS or (type_node := _param_type(param)) is None:
+            continue
+        if _is_bound(param, lmap):
             continue
         arity = _arity(param)
         typed += arity
         if _is_scalar(type_node, lmap.scalar_type_names):
             scalar += arity
     return typed, scalar
+
+
+def _is_bound(param: Node, lmap: LanguageNodeMap) -> bool:
+    if not lmap.bound_param_markers:
+        return False
+    words = _marker_words(param)
+    # Kotlin keeps a parameter's annotations on the sibling before it.
+    prev = param.prev_named_sibling
+    if prev is not None and prev.type == "parameter_modifiers":
+        words |= _leaf_words([prev])
+    return bool(words & lmap.bound_param_markers)
+
+
+def bound_param_count(params: Node | None, lmap: LanguageNodeMap) -> int:
+    """Parameters of *params* a framework binds by annotation."""
+    if not lmap.bound_param_markers or params is None:
+        return 0
+    return sum(
+        _arity(p) for p in params.named_children if p.type not in _NON_PARAMS and _is_bound(p, lmap)
+    )

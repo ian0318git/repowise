@@ -7,8 +7,11 @@ under ``docs_src/`` or a vendored ``typeahead.jquery.js`` can carry a perfectly
 real finding that nobody should be asked to fix first.
 
 The answer is one of :data:`CODE_ORIGINS`, decided in precedence order, so a
-file has exactly one: ``generated`` beats ``vendored`` beats ``test`` beats
-``docs_example`` beats ``tooling``, and everything else is ``production``.
+file has exactly one: ``generated`` beats ``vendored`` beats ``build`` beats
+``test`` beats ``docs_example`` beats ``tooling``, and everything else is
+``production``. ``build`` is decided by the file's type (a Gradle script, a
+``CMakeLists.txt``, a bundler config), wherever it sits; :func:`is_build_file`
+answers it for a caller that needs only that.
 
 The generated-file banner rule is the one ingestion already applies before it
 indexes a file (:func:`is_generated_header`, moved here from the traverser so
@@ -21,8 +24,10 @@ a caller holding a bare path gets the same answer.
 
 from __future__ import annotations
 
+import os
 import re
 from functools import cache, lru_cache
+from itertools import pairwise
 from pathlib import PurePosixPath
 from typing import Literal
 
@@ -33,11 +38,17 @@ __all__ = [
     "CODE_ORIGINS",
     "CodeOrigin",
     "code_origin",
+    "is_build_file",
     "is_generated_header",
+    "is_migration_path",
     "is_vendored_or_generated_path",
+    "path_origin",
+    "ship_rank",
 ]
 
-CodeOrigin = Literal["production", "test", "vendored", "docs_example", "generated", "tooling"]
+CodeOrigin = Literal[
+    "production", "test", "vendored", "docs_example", "generated", "tooling", "build"
+]
 
 CODE_ORIGINS: tuple[CodeOrigin, ...] = (
     "production",
@@ -46,6 +57,7 @@ CODE_ORIGINS: tuple[CodeOrigin, ...] = (
     "docs_example",
     "generated",
     "tooling",
+    "build",
 )
 
 # --------------------------------------------------------------------------
@@ -78,6 +90,10 @@ _DOCSTRING_OPENER_RE = re.compile(r"""^[rRuUbB]?(?:\"\"\"|''')""")
 _GENERATED_DIR_TOKENS = frozenset({"__generated__", "generated-src", "generated-sources"})
 _GENERATED_BUILD_DIR = "generated"
 _BUILD_OUTPUT_PARENTS = frozenset({"main", "build", "target"})
+# Adjacent directories a generator owns where neither name does alone:
+# CocoaPods writes ``Pods/Target Support Files/``; a bare ``pods/`` is as often
+# a first-party package (Kubernetes pods).
+_GENERATED_DIR_PAIRS = frozenset({("pods", "target support files")})
 # Beyond the first two lines, only an explicit sentence in a comment counts:
 # Java generators put "This class is generated." in the class Javadoc, after
 # the license and the imports. The looser markers ("DO NOT EDIT") stay
@@ -97,6 +113,12 @@ _GENERATED_SENTENCE_RE = re.compile(
     r"|GENERATED\b.*(?:\bINSTEAD\b|\bDO NOT (?:HAND[- ])?(?:EDIT|MODIFY)|\bNOT BE (?:EDITED|MODIFIED))"
     r")"
 )
+# Dart build_runner's banner, written after the license, past the first two
+# lines. Only the whole line counts: "Do not modify by hand without ..." or
+# "Generated code: see docs" in a hand-written file says something else.
+_GENERATED_BANNER_LINE_RE = re.compile(r"^GENERATED CODE - DO NOT MODIFY BY HAND\s*$")
+# Visual Studio rewrites resource headers, but ingestion must keep their include edges.
+_VISUAL_CPP_BANNER_LINE_RE = re.compile(r"^MICROSOFT VISUAL C\+\+ GENERATED INCLUDE FILE\.?\s*$")
 _GENERATED_SENTENCE_LINES = 40
 _PREAMBLE_PREFIXES = ("package ", "import ", "from ", "using ")
 
@@ -162,9 +184,17 @@ def _leading_generated_sentence(header: str) -> bool:
         if text is None:
             if not line.startswith(_PREAMBLE_PREFIXES):
                 return False
-        elif _GENERATED_SENTENCE_RE.search(text.upper()) and not _above_import(lines, i):
+        elif _says_generated(text.upper()) and not _above_import(lines, i):
             return True
     return False
+
+
+def _says_generated(text: str) -> bool:
+    return bool(
+        _GENERATED_SENTENCE_RE.search(text)
+        or _GENERATED_BANNER_LINE_RE.search(text)
+        or _VISUAL_CPP_BANNER_LINE_RE.search(text)
+    )
 
 
 def _above_import(lines: list[str], i: int) -> bool:
@@ -206,11 +236,56 @@ def _code_suffixes() -> tuple[str, ...]:
 def _generated_suffixes() -> tuple[str, ...]:
     from .ingestion.languages.registry import REGISTRY
 
-    return tuple(sorted(REGISTRY.generated_suffixes()))
+    return tuple(sorted({s.lower() for s in REGISTRY.generated_suffixes()}))
+
+
+@cache
+def _deps_suffixes() -> tuple[str, ...]:
+    from .ingestion.languages.registry import REGISTRY
+
+    return tuple(sorted(REGISTRY.extensions_for(_DEPS_LANGUAGES)))
+
+
+# A bundler's output (webpack's ``[name].bundle.js``, an esbuild ``a2ui.bundle.js``).
+# Kept out of the registry's generated suffixes, which ingestion skips: the file
+# stays in the graph and only leaves the fix lists.
+_BUNDLE_SUFFIXES = (".bundle.js", ".bundle.mjs", ".bundle.cjs")
+# Dart build_runner outputs (json_serializable, freezed, auto_route, mockito,
+# flutter_gen), kept out of the registry for the same reason: a ``part`` file
+# must stay in the graph. ``.config.dart`` is not here: injectable writes one,
+# but the name is as often a hand-written config.
+_CODEGEN_SUFFIXES = (".g.dart", ".freezed.dart", ".gr.dart", ".mocks.dart", ".gen.dart")
 
 
 def _is_generated_name(name: str) -> bool:
-    return ".generated." in name or name.endswith(_generated_suffixes())
+    lowered = name.lower()
+    return (
+        ".generated." in lowered
+        or lowered.endswith(_generated_suffixes())
+        or lowered.endswith(_BUNDLE_SUFFIXES)
+        or lowered.endswith(_CODEGEN_SUFFIXES)
+    )
+
+
+# A bundler's output by its content, for chunks with no telling name: a
+# minified head (a mean line over 1,000 chars across at least 2 KB; hand-written
+# code averages well under 100), or webpack's chunk and runtime shapes, which
+# only webpack writes: ``(self.webpackChunkapp = ...).push(`` and a file
+# opening with the ``/******/`` runtime banner that defines
+# ``__webpack_require__``.
+_MINIFIED_MIN_HEAD = 2048
+_MINIFIED_MEAN_LINE = 1000
+_WEBPACK_CHUNK_RE = re.compile(
+    r"\(\s*(?:self|window|this|globalThis)(?:\.|\[\s*[\"'])webpack(?:Chunk|Jsonp)[\w$]*"
+)
+_WEBPACK_RUNTIME_RE = re.compile(r"\A\s*/\*{6}/.*?__webpack_require__", re.DOTALL)
+
+
+def _is_bundler_output(header: str) -> bool:
+    lines = header.count("\n") + 1
+    if len(header) >= _MINIFIED_MIN_HEAD and len(header) > _MINIFIED_MEAN_LINE * lines:
+        return True
+    return bool(_WEBPACK_CHUNK_RE.search(header) or _WEBPACK_RUNTIME_RE.search(header))
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +303,9 @@ _VENDORED_DIR_TOKENS = frozenset(
         "node_modules",
         "bower_components",
         "site-packages",
+        # The Dart SDK's embedding headers that Flutter FFI plugins keep a copy
+        # of (``src/dart-sdk/include/dart_api_dl.h``).
+        "dart-sdk",
     }
 )
 # Matched as the first segment, or as a native tree's library shelf
@@ -236,6 +314,13 @@ _VENDORED_DIR_TOKENS = frozenset(
 # monorepo's own libraries as it is a copy of someone else's code.
 _VENDORED_ROOT_TOKENS = frozenset({"external", "externals"})
 _NATIVE_TREE = "native"
+# A ``deps/`` directory holding a library directory (aria2's ``deps/wslay/``,
+# hugo's ``internal/warpc/deps/parson/``). A file directly in ``deps/`` is the
+# repository's own (hugo's ``deps/deps.go``). C and C++ only: those trees copy
+# libraries in by hand, while a Go, Rust or JS ``deps/`` package with
+# sub-packages (``internal/deps/resolver/``) is usually first-party.
+_DEPS_DIR = "deps"
+_DEPS_LANGUAGES = ("c", "cpp")
 _MINIFIED_SUFFIXES = (".min.js", ".min.css", ".min.mjs")
 
 
@@ -248,6 +333,8 @@ def _is_vendored_path(lowered_name: str, dirs: list[str]) -> bool:
     if any(
         d == _NATIVE_TREE and dirs[i + 1] in _VENDORED_ROOT_TOKENS for i, d in enumerate(dirs[:-2])
     ):
+        return True
+    if _DEPS_DIR in dirs[:-1] and lowered_name.endswith(_deps_suffixes()):
         return True
     return lowered_name.endswith(_MINIFIED_SUFFIXES)
 
@@ -302,17 +389,147 @@ def _third_party_header(header: str, project: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+# Build files, by type: what a build tool reads to configure, compile, package
+# or run the project. A build tool loads each by its name, nothing imports one,
+# and none ships, in whatever directory it sits. Exact names, spelled as the
+# tool spells them (Bazel's ``BUILD`` is not a ``build`` script), by ecosystem.
+_BUILD_FILE_NAMES = frozenset(
+    {
+        # Gradle, Maven, sbt, Mill and their wrappers
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        "gradlew.bat",
+        "pom.xml",
+        "mvnw",
+        "mvnw.cmd",
+        "build.sbt",
+        "build.sc",
+        "build.mill",
+        # CMake, Make, Autotools, Meson, SCons, Premake, xmake, Zig, Just
+        "CMakeLists.txt",
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "Makefile.am",
+        "Makefile.in",
+        "configure.ac",
+        "configure.in",
+        "meson.build",
+        "meson_options.txt",
+        "meson.options",
+        "SConstruct",
+        "SConscript",
+        "premake4.lua",
+        "premake5.lua",
+        "xmake.lua",
+        "build.zig",
+        "Justfile",
+        "justfile",
+        # Bazel, Buck
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+        "MODULE.bazel",
+        "BUCK",
+        # Cargo, SwiftPM, Mage, Mix, Leiningen, tools.build, Perl, Conan, nox
+        "Cargo.toml",
+        "Package.swift",
+        "magefile.go",
+        "mix.exs",
+        "project.clj",
+        "build.clj",
+        "Makefile.PL",
+        "Build.PL",
+        "conanfile.py",
+        "noxfile.py",
+        # Ruby and JS task runners
+        "Rakefile",
+        "Gruntfile.js",
+        "Gruntfile.coffee",
+    }
+)
+# Suffixes that only a build file carries: Gradle scripts and precompiled
+# script plugins, CMake modules, Make includes, Starlark, MSBuild imports
+# (``Directory.Build.props``), package specs.
+_BUILD_SUFFIXES = (
+    ".gradle",
+    ".gradle.kts",
+    ".cmake",
+    ".mk",
+    ".bzl",
+    ".props",
+    ".targets",
+    ".gemspec",
+    ".podspec",
+    # Cake (C# make): ``build.cake`` and its loaded ``*.cake`` scripts
+    ".cake",
+    ".rockspec",
+)
+# Bundler configs, gulp files, any extension a JS tool's config takes, and
+# SwiftPM version-specific manifests (``Package@swift-6.0.swift``).
+_BUILD_NAME_RE = re.compile(
+    r"^(?:gulpfile|(?:webpack|vite|rollup|rolldown|rspack|esbuild|tsup)\.config(?:\.[\w-]+)*)"
+    r"\.[cm]?[jt]s$"
+    r"|^package@swift-\d+(?:\.\d+){0,2}\.swift$"
+)
+# Names a build tool reads only at the root: a nested ``setup.py`` is as often
+# a module (``homeassistant/setup.py`` sets up integrations).
+_BUILD_ROOT_NAMES = frozenset({"setup.py"})
+# Cargo runs ``build.rs`` from a crate root; directly in ``src/`` it is a
+# module (``mod build;``). A crate root can sit under ``src/`` too
+# (``src/bootstrap/build.rs`` in rust-lang/rust), so as a dead-code root every
+# ``build.rs`` not directly in ``src/`` counts: a module there is reached by
+# its ``mod`` edge anyway. As an origin, which hides code from fix lists, only
+# one with no ``src/`` above it counts (``cli/src/commands/build.rs`` is a
+# module).
+_CRATE_ROOT_NAMES = frozenset({"build.rs"})
+_SOURCE_DIR = "src"
+
+
+def _is_build_name(name: str, dirs: list[str], *, as_origin: bool = False) -> bool:
+    lowered = name.lower()
+    return (
+        name in _BUILD_FILE_NAMES
+        or lowered.endswith(_BUILD_SUFFIXES)
+        or bool(_BUILD_NAME_RE.match(lowered))
+        or (not dirs and name in _BUILD_ROOT_NAMES)
+        or (name in _CRATE_ROOT_NAMES and _at_crate_root(dirs, as_origin=as_origin))
+    )
+
+
+def _at_crate_root(dirs: list[str], *, as_origin: bool) -> bool:
+    return _SOURCE_DIR not in dirs if as_origin else dirs[-1:] != [_SOURCE_DIR]
+
+
+@lru_cache(maxsize=65536)
+def is_build_file(path: str) -> bool:
+    """Whether *path* is a build file: a build tool runs it, nothing imports it.
+
+    Decided by the file's type alone, so it holds under ``vendor/`` or a test
+    tree too. Dead code reads this as a root: such a file is never unreachable.
+    """
+    split = _split(path)
+    return split is not None and _is_build_name(split[1], split[2])
+
+
+# --------------------------------------------------------------------------
 # Docs, examples, tooling
 # --------------------------------------------------------------------------
 
-# Docs roots count at any depth. Docs are the plural and FastAPI's ``docs_src``
-# only: a singular ``doc/`` is as often a shipped package (cobra's ``doc``
-# generates man pages) as a documentation tree.
+# Plural only: a singular ``doc/`` is as often a shipped package. Where they
+# count is :func:`_is_docs_example`'s rule.
 _DOCS_ROOT_TOKENS = frozenset({"docs", "docs_src"})
 # Examples as ``support_paths`` reads them, less the benchmark harnesses, which
 # run the system (tooling below). Unlike ``support_paths`` these count only as
-# the first segment or directly under a docs root: ``src/pkg/examples/`` is
-# as often shipped code (an example registry, a runner) as a sample.
+# the first segment or under a docs root: ``src/pkg/examples/`` is as often
+# shipped code (an example registry, a runner) as a sample.
 _EXAMPLE_TOKENS = EXAMPLE_DIR_TOKENS - {"bench", "benches", "benchmarks"}
 _TUTORIAL_PREFIX = "tutorial"
 
@@ -321,15 +538,113 @@ def _is_example_dir(segment: str) -> bool:
     return segment in _EXAMPLE_TOKENS or segment.startswith(_TUTORIAL_PREFIX)
 
 
-def _is_docs_example(dirs: list[str]) -> bool:
-    # Anything under a docs root already counts, examples beneath it included.
-    return any(d in _DOCS_ROOT_TOKENS for d in dirs) or bool(dirs and _is_example_dir(dirs[0]))
+# Example directories a build tool compiles as examples at any depth, by file
+# suffix: Cargo builds every crate's ``examples/`` as example targets
+# (ripgrep's ``crates/grep/examples/``). Outside a ``src/`` tree only: under
+# it, ``examples`` is a module of the crate.
+_TOOL_EXAMPLE_DIRS = {".rs": "examples"}
+_SOURCE_ROOT = "src"
 
 
-# Close to ``perf/causal.py``'s tooling parts, with two differences: the
-# benchmark spellings ``bench`` / ``benches`` join ``benchmarks``, and there is
-# no ``/cli/`` rule, since a CLI's source ships and its findings are real work.
-# Migrations join too: they run once at deploy time and are append-only.
+def _is_tool_example(name: str, dirs: list[str]) -> bool:
+    example_dir = _TOOL_EXAMPLE_DIRS.get(PurePosixPath(name).suffix.lower())
+    if example_dir is None or example_dir not in dirs:
+        return False
+    return _SOURCE_ROOT not in dirs[: dirs.index(example_dir)]
+
+
+# A docs-named folder that is not plainly ``docs`` counts only with evidence:
+# a docs-site generator's config in it or one level down (Writerside keeps its
+# under ``Writerside/``). Without one it may be a shipped package.
+_DOCS_SITE_NAMES = frozenset({"doc", "documentation"})
+# ``documentation-website``, ``docs-site``: a suffixed name is as often a
+# service (``doc-service``, ``docs-api``), so it needs a generator-specific file.
+_DOCS_SITE_SUFFIXED_RE = re.compile(r"^(?:docs?|documentation)[-_.]")
+_DOCS_SITE_MARKERS = frozenset(
+    {
+        "writerside.cfg",
+        "mkdocs.yml",
+        "mkdocs.yaml",
+        "docusaurus.config.js",
+        "docusaurus.config.ts",
+        "docusaurus.config.mjs",
+        "book.toml",  # mdBook
+        "antora.yml",
+        "docfx.json",
+        ".vitepress",
+    }
+)
+# Generic config names that mean a docs site only beside the site's own files,
+# and only under a plain ``doc`` / ``documentation`` folder.
+_DOCS_SITE_PAIRED_MARKERS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("conf.py", frozenset({"index.rst", "index.md"})),  # Sphinx
+    ("_config.yml", frozenset({"_posts", "_layouts"})),  # Jekyll
+)
+
+
+def _has_docs_site_config(names: set[str], paired: bool) -> bool:
+    if names & _DOCS_SITE_MARKERS:
+        return True
+    return paired and any(
+        config in names and names & companions
+        for config, companions in _DOCS_SITE_PAIRED_MARKERS
+    )
+
+
+def _entry_names(folder: str) -> tuple[set[str], list[str]]:
+    """Lower-cased entry names in *folder*, and its subfolders' paths."""
+    try:
+        with os.scandir(folder) as entries:
+            listed = [(e.name.lower(), e.path, e.is_dir()) for e in entries]
+    except OSError:
+        return set(), []
+    return {name for name, _, _ in listed}, [path for _, path, is_dir in listed if is_dir]
+
+
+@lru_cache(maxsize=4096)
+def _is_docs_site(folder: str, paired: bool) -> bool:
+    """Whether *folder* (an absolute path) or a direct subfolder holds a
+    docs-site generator's config."""
+    names, subfolders = _entry_names(folder)
+    return _has_docs_site_config(names, paired) or any(
+        _has_docs_site_config(_entry_names(sub)[0], paired) for sub in subfolders
+    )
+
+
+def _is_docs_example(
+    normalized: str, dirs: list[str], repo_root: str | os.PathLike[str] | None
+) -> bool:
+    """A docs root or example folder as the first segment, a build tool's example
+    target, or a docs folder deeper beside a docs-site generator's config. A
+    nested ``app/docs/`` with no such config is the product's own docs route."""
+    if (
+        bool(dirs and (dirs[0] in _DOCS_ROOT_TOKENS or _is_example_dir(dirs[0])))
+        or _is_tool_example(normalized, dirs)
+    ):
+        return True
+    if repo_root is None:
+        return False
+    parts = normalized.split("/")
+    root = os.fspath(repo_root)
+
+    def site(i: int, paired: bool) -> bool:
+        return _is_docs_site(os.path.join(root, *parts[:i]), paired)
+
+    return any(
+        # A nested docs root beside its site's config, read from its parent.
+        (d in _DOCS_ROOT_TOKENS and site(i, False))
+        or (
+            (d in _DOCS_SITE_NAMES or _DOCS_SITE_SUFFIXED_RE.match(d))
+            and site(i + 1, d in _DOCS_SITE_NAMES)
+        )
+        for i, d in enumerate(dirs)
+    )
+
+
+# No ``/cli/`` rule: a CLI's source ships and its findings are real work (only
+# performance treats a CLI loop as off the request path, in
+# ``perf/causal.execution_context``). Migrations join: they run once at deploy
+# time and are append-only.
 _TOOLING_DIR_TOKENS = frozenset(
     {
         ".github",
@@ -350,13 +665,28 @@ _TOOLING_DIR_TOKENS = frozenset(
 _TOOLING_ROOT_DIRS = frozenset(
     {"buildsrc", "build-logic", "build-conventions", "build-tools", "build-tools-internal"}
 )
-_TOOLING_ROOT_NAMES = frozenset(
-    {"setup.py", "noxfile.py", "fabfile.py", "Rakefile", "Gruntfile.js"}
-)
+# Schema migrations: a ``migrations/`` directory (above), or adjacent
+# directories where neither name does alone. Rails keeps them in
+# ``db/migrate``, Alembic in ``alembic/versions``; a bare ``versions/`` is too
+# common (API versions) to class on its own. Ceiling: an Alembic script
+# directory with another name is recognised only by its sibling ``env.py``,
+# which a path-only classifier cannot see.
+_MIGRATION_DIR = "migrations"
+_MIGRATION_DIR_PAIRS = frozenset({("db", "migrate"), ("alembic", "versions")})
+_TOOLING_ROOT_NAMES = frozenset({"fabfile.py"})
+# Benchmarks kept beside the code they measure (abseil's
+# ``mutex_benchmark.cc``), not in a benchmarks directory.
+_TOOLING_STEM_SUFFIXES = ("_benchmark", "_benchmarks")
+# Lint, test and transpiler configs. Bundler configs are build files (above).
 _TOOLING_NAME_RE = re.compile(
-    r"^(?:gulpfile|webpack\.config|vite\.config|rollup\.config|eslint\.config|"
-    r"jest\.config|vitest\.config|babel\.config|karma\.conf)\.[cm]?[jt]s$"
+    r"^(?:eslint\.config|jest\.config|vitest\.config|babel\.config|karma\.conf)\.[cm]?[jt]s$"
 )
+# Dart's package layout keeps private scripts in ``tool/`` beside ``lib/``. A bare
+# ``tool`` is shipped code elsewhere (Go's ``internal/tool``), so it counts only
+# for Dart files, and not once it sits under a package's shipped ``lib``/``bin``/
+# ``web``. Ceiling: path-only, so a ``tool/`` not at a package root also counts.
+_DART_TOOL_DIR = "tool"
+_DART_SHIPPED_DIRS = frozenset({"lib", "bin", "web"})
 
 
 def _header_text(text: str | bytes | None) -> str:
@@ -381,6 +711,7 @@ def _is_generated_path(name: str, dirs: list[str]) -> bool:
     return (
         _is_generated_name(name)
         or any(d in _GENERATED_DIR_TOKENS for d in dirs)
+        or any(pair in _GENERATED_DIR_PAIRS for pair in pairwise(dirs))
         or any(
             d == _GENERATED_BUILD_DIR and i and dirs[i - 1] in _BUILD_OUTPUT_PARENTS
             for i, d in enumerate(dirs)
@@ -402,13 +733,39 @@ def is_vendored_or_generated_path(path: str) -> bool:
     return _is_generated_path(name, dirs) or _is_vendored_path(name.lower(), dirs)
 
 
-def _is_tooling(normalized: str, name: str, dirs: list[str]) -> bool:
+def _is_migration_dir(dirs: list[str]) -> bool:
+    return _MIGRATION_DIR in dirs or any(pair in _MIGRATION_DIR_PAIRS for pair in pairwise(dirs))
+
+
+def is_migration_path(path: str) -> bool:
+    """Whether *path* is a schema migration: generated once, append-only, and
+    meant to stay self-contained, so no shared helper or split belongs in it."""
+    split = _split(path)
+    return split is not None and _is_migration_dir(split[2])
+
+
+def _is_tooling(name: str, dirs: list[str]) -> bool:
     return (
         any(d in _TOOLING_DIR_TOKENS for d in dirs)
         or bool(dirs and dirs[0] in _TOOLING_ROOT_DIRS)
-        or "/alembic/versions/" in f"/{normalized.lower()}"
+        or _is_migration_dir(dirs)
         or (not dirs and name in _TOOLING_ROOT_NAMES)
         or bool(_TOOLING_NAME_RE.match(name.lower()))
+        or _is_benchmark_file(name)
+        or _is_dart_tool(name, dirs)
+    )
+
+
+def _is_dart_tool(name: str, dirs: list[str]) -> bool:
+    if not name.lower().endswith(".dart") or _DART_TOOL_DIR not in dirs:
+        return False
+    return _DART_SHIPPED_DIRS.isdisjoint(dirs[: dirs.index(_DART_TOOL_DIR)])
+
+
+def _is_benchmark_file(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith(_code_suffixes()) and PurePosixPath(lowered).stem.endswith(
+        _TOOLING_STEM_SUFFIXES
     )
 
 
@@ -418,6 +775,7 @@ def code_origin(
     *,
     is_test: bool | None = None,
     project: str | None = None,
+    repo_root: str | os.PathLike[str] | None = None,
 ) -> CodeOrigin:
     """The one origin of the file at repo-relative *path*.
 
@@ -431,6 +789,10 @@ def code_origin(
 
     *project* is the repository's name, so its own release banner is not
     taken for someone else's.
+
+    *repo_root* lets a docs-named folder other than ``docs`` count as docs
+    when it holds a docs-site generator's config. ``None`` skips that check,
+    so such a folder stays production and only the path rules apply.
     """
     split = _split(path)
     if split is None:
@@ -438,9 +800,7 @@ def code_origin(
     normalized, name, dirs = split
     header = _header_text(text)
 
-    if _is_generated_path(name, dirs) or (
-        header and (_declares_generated(name, header) or _is_reference_stub(name, dirs, header))
-    ):
+    if _is_generated_path(name, dirs) or (header and _is_generated_content(name, dirs, header)):
         return "generated"
     if _is_vendored_path(name.lower(), dirs) or (
         header
@@ -448,14 +808,52 @@ def code_origin(
         and _third_party_header(header, project)
     ):
         return "vendored"
+    return _maintained_origin(normalized, name, dirs, is_test, repo_root)
 
+
+def _is_generated_content(name: str, dirs: list[str], header: str) -> bool:
+    return (
+        _declares_generated(name, header)
+        or _is_reference_stub(name, dirs, header)
+        or _is_bundler_output(header)
+    )
+
+
+def _maintained_origin(
+    normalized: str,
+    name: str,
+    dirs: list[str],
+    is_test: bool | None,
+    repo_root: str | os.PathLike[str] | None,
+) -> CodeOrigin:
+    """The origin of code this repository maintains: build, test, docs or
+    examples, tooling, or production, in that precedence."""
+    if _is_build_name(name, dirs, as_origin=True):
+        return "build"
     if is_test if is_test is not None else is_test_related_path(normalized):
         return "test"
-
-    if _is_docs_example(dirs):
+    if _is_docs_example(normalized, dirs, repo_root):
         return "docs_example"
-
-    if _is_tooling(normalized, name, dirs):
+    if _is_tooling(name, dirs):
         return "tooling"
-
     return "production"
+
+
+@lru_cache(maxsize=65536)
+def path_origin(path: str) -> CodeOrigin:
+    """:func:`code_origin` from the path alone, memoised.
+
+    For callers holding no file content and no stored origin. A caller holding
+    the stored ``code_origin`` reads that instead: it also saw the file's head.
+    """
+    return code_origin(path)
+
+
+def ship_rank(path: str) -> int:
+    """Sort key for ranked lists: product code 0, other non-test code 1, tests 2.
+
+    A build script, a tool or a copied library can carry a real finding, but it
+    never leads a list of things to fix ahead of the code that ships.
+    """
+    origin = path_origin(path)
+    return 0 if origin == "production" else 2 if origin == "test" else 1

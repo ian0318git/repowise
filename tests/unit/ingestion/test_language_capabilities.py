@@ -52,12 +52,22 @@ class TestParityGoldens:
 
     def test_test_stem_suffixes_match_historical_set(self) -> None:
         # "_unittest" (C/C++ GoogleTest convention) was a conscious
-        # addition to the historical {"_test", "_spec"} union.
-        assert set(REGISTRY.test_stem_suffixes()) == {"_test", "_spec", "_unittest"}
+        # addition to the historical {"_test", "_spec"} union, and so are the
+        # C/C++ test-helper stems (cord_test_helpers.h, log_basic_test_impl.inc).
+        assert set(REGISTRY.test_stem_suffixes()) == {
+            "_test",
+            "_spec",
+            "_unittest",
+            "_test_helper",
+            "_test_helpers",
+            "_test_util",
+            "_test_impl",
+        }
 
     def test_test_infixes_match_historical_set(self) -> None:
-        # `.test-d.` is the TypeScript type-test infix (`*.test-d.ts`).
-        assert set(REGISTRY.test_infixes()) == {".test.", ".spec.", ".test-d."}
+        # `.test-d.` is the TypeScript type-test infix (`*.test-d.ts`), `.suite.`
+        # a vitest suite module (`*.suite.ts`).
+        assert set(REGISTRY.test_infixes()) == {".test.", ".spec.", ".test-d.", ".suite.", ".e2e."}
 
     def test_test_fixture_stems_match_historical_set(self) -> None:
         assert frozenset(
@@ -131,7 +141,15 @@ class TestParityGoldens:
 
     def test_test_dir_suffixes_union(self) -> None:
         # .Specs = BDD-style sibling test projects (Polly, validated live).
-        assert REGISTRY.test_dir_suffixes() == (".Specs", ".Tests")
+        assert REGISTRY.test_dir_suffixes() == (
+            ".FunctionalTests",
+            ".FuzzTests",
+            ".IntegrationTests",
+            ".Specs",
+            ".Tests",
+            ".UnitTest",
+            ".UnitTests",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +157,9 @@ class TestParityGoldens:
 # ---------------------------------------------------------------------------
 
 _FULL = {
+    # astro projects its frontmatter and <script> bodies to TypeScript
+    # through the same SFC pass as svelte, so its imports are ordinary ESM.
+    "astro",
     "c",
     "cpp",
     "csharp",

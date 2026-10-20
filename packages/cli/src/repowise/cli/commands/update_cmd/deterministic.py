@@ -92,6 +92,7 @@ def regenerate_deterministic_pages(
     dead_code_report: Any = None,
     prior_page_ids: dict | None = None,
     full_scope: bool = False,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Re-render the template pages for *regenerate_paths*. Never raises.
 
@@ -119,6 +120,7 @@ def regenerate_deterministic_pages(
         prior_page_ids=prior_page_ids,
         degrade_label="Template page refresh",
         full_scope=full_scope,
+        stats_out=stats_out,
     )
 
 
@@ -137,6 +139,7 @@ def regenerate_deterministic_page_ids(
     dead_code_report: Any = None,
     prior_page_ids: dict | None = None,
     vector_store: Any = None,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Render exact deterministic page ids from the complete repository view.
 
@@ -164,6 +167,7 @@ def regenerate_deterministic_page_ids(
         degrade_label="Structural page refresh",
         only_page_ids=page_ids,
         vector_store=vector_store,
+        stats_out=stats_out,
     )
 
 
@@ -185,11 +189,16 @@ def _render_pages(
     full_scope: bool = False,
     only_page_ids: set[str] | None = None,
     vector_store: Any = None,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Render the changed files' pages from structure (free, no LLM).
 
     Every file page is structural now, so there is one render mode: the template
     renderer, driven by ``deterministic=True``. There is no model path to choose.
+
+    ``stats_out["embed_failed_pages"]`` accumulates the pages whose vectors
+    failed to land, so the caller can fail the run instead of reporting a
+    healthy semantic index.
     """
     from repowise.core.generation import ContextAssembler, GenerationConfig, PageGenerator
     from repowise.core.providers.llm.template import TemplateProvider
@@ -254,8 +263,8 @@ def _render_pages(
         )
         # A template render takes every page it is fed; deterministic mode
         # bypasses the budget already, so no page-id scoping is needed.
-        with console.status("  Re-rendering wiki pages from structure…"):
-            return run_async(
+        with console.status("  Rebuilding documentation pages from code…"):
+            pages = run_async(
                 generator.generate_all(
                     affected_parsed,
                     affected_source,
@@ -266,8 +275,15 @@ def _render_pages(
                     repo_path=repo_path,
                     dead_code_report=dead_code_report,
                     only_page_ids=only_page_ids,
+                    # Without it a failed embed was logged and nothing else.
+                    on_warning=degraded.append,
                 )
             )
+        if stats_out is not None:
+            stats_out["embed_failed_pages"] = (
+                stats_out.get("embed_failed_pages", 0) + generator.embed_failed_pages
+            )
+        return pages
     except Exception as exc:
         degraded.append(f"{degrade_label}: {exc}")
         return []
@@ -459,6 +475,57 @@ async def _load_file_page_render_keys(repo_path: Path) -> dict[str, str]:
     except Exception:
         # Never block an update on this. Returning nothing means no page looks
         # stale, so the run does what it would have done before the salt.
+        return {}
+    finally:
+        await engine.dispose()
+
+
+def hydrate_symbol_complexity(repo_path: Path, parsed_files: list, paths: set[str]) -> None:
+    """Restore stored ``complexity_estimate`` on the symbols of *paths*.
+
+    A parse leaves every symbol at the default of 1; only health analysis
+    measures it, and an update analyses the changed files alone. Any other
+    file it re-renders would otherwise print 1 on every spotlight. The stored
+    value is what the last full health run measured for code that has not
+    changed since. Best effort: an unreadable store leaves the defaults.
+    """
+    if not paths:
+        return
+    stored = run_async(_load_symbol_complexity(repo_path))
+    if not stored:
+        return
+    for pf in parsed_files:
+        if pf.file_info.path not in paths:
+            continue
+        for sym in pf.symbols:
+            sid = getattr(sym, "id", None) or f"{pf.file_info.path}::{sym.name}"
+            value = stored.get(sid)
+            if value:
+                sym.complexity_estimate = value
+
+
+async def _load_symbol_complexity(repo_path: Path) -> dict[str, int]:
+    from repowise.cli.helpers import get_db_url_for_repo
+    from repowise.core.persistence import create_engine, create_session_factory, get_session
+
+    engine = create_engine(get_db_url_for_repo(repo_path))
+    try:
+        from sqlalchemy import select as sa_select
+
+        from repowise.core.persistence.crud import get_repository_by_path
+        from repowise.core.persistence.models import WikiSymbol
+
+        async with get_session(create_session_factory(engine)) as session:
+            repo = await get_repository_by_path(session, str(repo_path))
+            if repo is None:
+                return {}
+            rows = await session.execute(
+                sa_select(WikiSymbol.symbol_id, WikiSymbol.complexity_estimate).where(
+                    WikiSymbol.repository_id == repo.id
+                )
+            )
+            return {sid: int(value or 0) for sid, value in rows}
+    except Exception:
         return {}
     finally:
         await engine.dispose()

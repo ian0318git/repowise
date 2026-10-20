@@ -7,35 +7,38 @@
 ; Symbols
 ; ---------------------------------------------------------------------------
 
+; One pattern per declaration, modifiers optional: with a second pattern
+; that captured them, the bare one matched first and a class's annotations
+; (``@Component``, ``@State``) never reached its symbol.
 (class_declaration
-  name: (identifier) @symbol.name
-) @symbol.def
-
-(class_declaration
-  (modifiers) @symbol.modifiers
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 (interface_declaration
-  name: (identifier) @symbol.name
-) @symbol.def
-
-(interface_declaration
-  (modifiers) @symbol.modifiers
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 (enum_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 ; Java 16+ records: record Point(double x, double y) {}
 (record_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
-(record_declaration
-  (modifiers) @symbol.modifiers
+; An annotation type, and its elements as its methods: ``ann.value()`` calls one.
+(annotation_type_declaration
+  (modifiers)? @symbol.modifiers
+  name: (identifier) @symbol.name
+) @symbol.def
+
+(annotation_type_element_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
@@ -107,12 +110,39 @@
 ; bare name through the flat same-file index instead of against the caller's own
 ; class.
 ;
-; ``super`` stays out: ``super.m()`` arrives bare, where the caller's own class
-; answers it and the recursion refusal drops an override calling itself. No
-; member strategy answers a ``super`` receiver for Java, so capturing one would
-; only move the call onto its bare-name fallback, which skips the caller's class.
+; ``super.m()`` is captured too, so the resolver walks the caller's ancestors
+; instead of binding the caller's own override.
 (method_invocation
-  object: (this) @call.receiver
+  object: [(this) (super)] @call.receiver
+  name: (identifier) @call.target
+  arguments: (argument_list) @call.arguments
+) @call.site
+
+; Qualified super: ``S.super.m()``, where ``S`` is an enclosing class or a
+; superinterface. The plain member pattern above also matches it, with ``S`` as
+; the receiver; the parser drops that copy.
+(method_invocation
+  object: (identifier) @call.scope
+  (super) @call.receiver
+  name: (identifier) @call.target
+  arguments: (argument_list) @call.arguments
+) @call.site
+
+; Cast receiver: ((Foo) x).bar(args) names its type at the call site, like the
+; fluent construction below. A scoped type (``(a.Foo) x``) is left uncaptured,
+; and the anchors keep an intersection cast (``(Foo & Bar) x``) out.
+(method_invocation
+  object: (parenthesized_expression
+    (cast_expression
+      .
+      type: [
+        (type_identifier) @call.receiver
+        (generic_type (type_identifier) @call.receiver)
+      ]
+      .
+      value: (_)
+    )
+  )
   name: (identifier) @call.target
   arguments: (argument_list) @call.arguments
 ) @call.site

@@ -21,9 +21,8 @@ from fastapi import Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.test_reachability import (
-    call_graph_from_db,
-    files_reached_by_tests,
-    load_test_files,
+    cached_files_reached_by_tests,
+    cached_test_files,
     tests_reaching_by_tier,
 )
 from repowise.core.persistence import crud
@@ -34,6 +33,11 @@ from repowise.server.schemas.coverage import CoverageResponse
 from repowise.server.schemas.patch_coverage import PatchCoverageResponse
 
 from ._router import router
+
+
+def _score(m: Any) -> float | None:
+    """A file's health score; ``None`` where health has no dialect for it."""
+    return round(m.score, 2) if m.score is not None else None
 
 
 @router.get(
@@ -128,7 +132,7 @@ async def health_coverage(
         for f in files:
             m = metric_by_path.get(f["file_path"])
             if m is not None:
-                f["health_score"] = round(m.score, 2)
+                f["health_score"] = _score(m)
                 f["nloc"] = m.nloc
 
     # Always over the repo-wide read, never over ``files``: this is what the
@@ -209,10 +213,10 @@ async def _inferred_coverage(
 
     Degrades to ``basis: "none"`` rather than raising. An unindexed graph is the
     honest unknown, and failing the tab to withhold a secondary signal is the
-    wrong trade - the same call ``pr_blast._inferred_guarding_tests`` makes.
+    wrong trade.
     """
     try:
-        test_files = await load_test_files(session, repo_id)
+        test_files = await cached_test_files(session, repo_id)
         if not test_files:
             return {
                 "basis": "none",
@@ -252,8 +256,8 @@ async def _inferred_coverage(
                     "test_file_count": len(test_files),
                 },
             }
-        view = await call_graph_from_db(session, repo_id)
-        reached = files_reached_by_tests(view, test_files)
+        # Walked once per index state: the edge read is the cost of this tab.
+        reached = await cached_files_reached_by_tests(session, repo_id)
     except Exception:
         return {
             "basis": "none",
@@ -268,7 +272,7 @@ async def _inferred_coverage(
         {
             "file_path": m.file_path,
             "reached": m.file_path in reached,
-            "health_score": round(m.score, 2),
+            "health_score": _score(m),
             "nloc": m.nloc,
         }
         for m in rows[:limit]
@@ -416,6 +420,7 @@ async def health_coverage_patch(
         label=label,
         head_commit=head_sha or None,
         config=configured_coverage(repo.local_path),
+        repo_path=repo.local_path,
     )
     if patch is None:
         return None

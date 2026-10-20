@@ -87,6 +87,10 @@ def test_tokenize_file_reads_tsx_with_the_jsx_grammar():
 
 
 def test_tokenize_file_pascal_normalizes_identifiers_and_literals():
+    # Calls tokenize_file() directly with an inline byte literal, so it
+    # needs its own best-effort guard rather than inheriting one from a
+    # fixture-driven helper.
+    pytest.importorskip("tree_sitter_pascal", reason="run `uv sync --all-packages`")
     source = (
         b"unit U;\n interface\n implementation\n"
         b" procedure Foo;\n begin\n   WriteLn('hello', 42);\n end;\n end.\n"
@@ -403,6 +407,13 @@ def test_tokenize_file_drops_python_imports():
     assert [t.kind for t in toks] == ["ID", "=", "LIT"]
 
 
+def test_tokenize_file_drops_the_java_package_declaration():
+    toks = tokenize_file("java", b"package a.b;\nimport x.Y;\nclass C {}\n", "C.java")
+    assert "package" not in [t.kind for t in toks]
+    assert toks[0].kind == "class"
+    assert toks[0].start_line == 3
+
+
 def test_tokenize_file_drops_ts_imports_and_reexports_but_keeps_local_exports():
     source = (
         b'import { a, b } from "./x";\n'
@@ -454,6 +465,28 @@ def test_detect_clones_ignores_identical_import_blocks(tmp_path: Path):
     assert report.pairs == []
 
 
+def test_a_java_clone_starts_at_the_shared_code_not_the_package_line(tmp_path: Path):
+    header = "/* License header */\npackage com.acme.core.util;\n\n" + "".join(
+        f"import com.acme.core.mod{i}.Thing{i};\n" for i in range(12)
+    ) + "\n"
+    method = (
+        "    int total(int a, int b) {\n        int sum = a + b;\n        if (sum > 10) {\n"
+        "            return sum * 2;\n        }\n        for (int i = 0; i < b; i++) {\n"
+        "            sum += i;\n        }\n        return sum;\n    }\n"
+    )
+    a = _write(tmp_path, "A.java", header + "public class Alpha {\n" + method + "}\n")
+    b = _write(tmp_path, "B.java", header + "public class Beta {\n" + method + "}\n")
+    report = detect_clones(
+        [_pf("A.java", str(a), language="java"), _pf("B.java", str(b), language="java")]
+    )
+    # The pair is still found, from the class line (17) on: the package line
+    # is line 2 and the shared method is lines 18-27.
+    assert len(report.pairs) == 1
+    pair = report.pairs[0]
+    assert pair.a_start_line >= 17 and pair.b_start_line >= 17
+    assert pair.a_end_line >= 27 and pair.b_end_line >= 27
+
+
 def test_detect_clones_ignores_matching_data_literals(tmp_path: Path):
     table = "TABLE = [\n" + "".join(f"    ({i}, '{i}', {i}.5),\n" for i in range(20)) + "]\n"
     a = _write(tmp_path, "a.py", table)
@@ -472,3 +505,34 @@ def test_detect_clones_needs_shared_identifier_names(tmp_path: Path):
     report = detect_clones(parsed, window_tokens=20, min_lines=4)
     # Same shape with every name changed is not a copy; a real copy still is.
     assert {(p.file_a, p.file_b) for p in report.pairs} == {("a.py", "c.py")}
+
+
+def _issue_3271_body() -> str:
+    return "".join(
+        f"result{i} = compute(alpha{i}, beta{i})\nname{i} = lookup(result{i}, gamma)\n"
+        f"if name{i} == other:\n    done = finish(name{i}, result{i})\n"
+        for i in range(6)
+    )
+
+
+def test_detect_clones_does_not_pair_across_languages(tmp_path: Path):
+    """Issue #3271: identical token shapes in Python and TypeScript must not cross-pair."""
+    body = _issue_3271_body()
+    a = _write(tmp_path, "a.py", body)
+    b = _write(tmp_path, "b.ts", body)
+    parsed = [
+        _pf("a.py", str(a), "python"),
+        _pf("b.ts", str(b), "typescript"),
+    ]
+    report = detect_clones(parsed, {}, window_tokens=DEFAULT_WINDOW_TOKENS, min_lines=3)
+    cross = {(p.file_a, p.file_b) for p in report.pairs if p.file_a != p.file_b}
+    assert cross == set()
+
+
+def test_detect_clones_still_pairs_same_language_duplicates(tmp_path: Path):
+    body = _issue_3271_body()
+    a = _write(tmp_path, "a.py", body)
+    b = _write(tmp_path, "b.py", body)
+    parsed = [_pf("a.py", str(a)), _pf("b.py", str(b))]
+    report = detect_clones(parsed, {}, window_tokens=DEFAULT_WINDOW_TOKENS, min_lines=3)
+    assert any({p.file_a, p.file_b} == {"a.py", "b.py"} for p in report.pairs)

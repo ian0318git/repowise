@@ -26,6 +26,7 @@ from repowise.server.mcp_server.tool_health.pillars import (
 from repowise.server.mcp_server.tool_health.plans import _render_plans
 from repowise.server.mcp_server.tool_health.request import HealthRequest
 from repowise.server.mcp_server.tool_health.serialize import _serialize_finding
+from repowise.server.mcp_server.tool_health.what_if import what_if_block
 
 
 def add_optional_blocks(
@@ -55,6 +56,8 @@ def add_optional_blocks(
     # rows are selected: filtering here would filter a list already capped.
     if "refactoring" in include and req.wants("suggestion_legend"):
         result["suggestion_legend"] = _suggestion_legend(data)
+    if "what_if" in include and req.wants("what_if"):
+        result["what_if"] = what_if_block(data, req)
 
 
 def _add_biomarkers(result: dict[str, Any], data: HealthData, pager: Pager) -> None:
@@ -66,14 +69,20 @@ def _add_biomarkers(result: dict[str, Any], data: HealthData, pager: Pager) -> N
     """
     findings, repository = data.findings, data.reference_repository
     result["findings"] = pager.bound(
-        [_serialize_finding(f, repository) for f in findings.finding_rows],
+        [
+            _serialize_finding(f, repository, findings.lower_priority.get(f.id))
+            for f in findings.finding_rows
+        ],
         "findings",
     )
     result["findings_total"] = findings.findings_total
     # Dashboard mode only (targeted mode already set ``findings``), so this
     # uses the same production/test split as ``top_findings``.
     result["test_findings"] = pager.bound(
-        [_serialize_finding(f, repository) for f in findings.test_finding_rows],
+        [
+            _serialize_finding(f, repository, findings.lower_priority.get(f.id))
+            for f in findings.test_finding_rows
+        ],
         "test_findings",
     )
     result["test_findings_total"] = findings.test_findings_total

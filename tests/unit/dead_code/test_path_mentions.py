@@ -9,6 +9,8 @@ keeps its confidence.
 
 from __future__ import annotations
 
+import pytest
+
 from repowise.core.analysis.dead_code import DeadCodeAnalyzer, DeadCodeKind
 from repowise.core.analysis.dead_code.models import DeadCodeFindingData
 from repowise.core.analysis.dead_code.name_occurrences import clamp_path_mentions
@@ -127,3 +129,147 @@ def test_a_truly_dead_file_through_the_analyzer_keeps_full_confidence():
     assert by_path["pkg/old.py"].confidence == 1.0
     assert by_path["pkg/listed.py"].confidence == RISK_CAP_CONFIDENCE
     assert by_path["pkg/listed.py"].safe_to_delete is False
+
+
+def _export(path: str, name: str) -> DeadCodeFindingData:
+    finding = _file(path)
+    finding.kind = DeadCodeKind.UNUSED_EXPORT
+    finding.symbol_name = name
+    return finding
+
+
+def test_a_relative_path_resolves_against_the_naming_files_directory():
+    config = 'export default { test: { setupFiles: ["./vitest.setup.ts"] } }\n'
+    assert _dropped("src/vitest.setup.ts", {"src/vitest.config.ts": config})
+
+
+def test_a_relative_path_from_a_doc_is_capped_not_dropped():
+    finding = _clamp("pkg/run.py", {"pkg/README.md": "Run `./run.py` by hand.\n"})
+    assert finding.confidence == RISK_CAP_CONFIDENCE
+
+
+def test_a_relative_path_never_reaches_a_sibling_directory():
+    config = 'export default { test: { setupFiles: ["./vitest.setup.ts"] } }\n'
+    finding = _clamp("web/vitest.setup.ts", {"src/vitest.config.ts": config})
+    assert finding.confidence == 1.0
+
+
+def test_the_changesets_changelog_module_and_its_exports_are_used():
+    config = '{"changelog": "./changelog-config.js", "commit": false}\n'
+    module = ".changeset/changelog-config.js"
+    source = {
+        ".changeset/config.json": config,
+        module: "const getReleaseLine = async () => ''\nconst fns = { getReleaseLine }\n"
+        "module.exports = fns\n",
+    }
+    findings = [_file(module), _export(module, "getReleaseLine")]
+    assert clamp_path_mentions(findings, {p: s.encode() for p, s in source.items()}) == []
+
+
+def test_a_setup_file_a_config_runs_keeps_its_unused_exports():
+    # vitest runs a setup file for its side effects; nothing reads its exports.
+    config = 'export default { test: { setupFiles: ["./vitest.setup.ts"] } }\n'
+    setup = "export function allowNetConnect() {}\nbeforeAll(() => {})\n"
+    source = {"src/vitest.config.ts": config, "src/vitest.setup.ts": setup}
+    finding = _export("src/vitest.setup.ts", "allowNetConnect")
+    assert clamp_path_mentions([finding], {p: s.encode() for p, s in source.items()}) == [finding]
+
+
+def test_an_export_a_manifest_lists_keeps_its_confidence():
+    # A coverage omit list in pyproject.toml names a file without loading it.
+    finding = _export("pkg/contrib/plugin.py", "setup")
+    source = {"pyproject.toml": b'omit = ["*pkg/contrib/plugin.py"]\n'}
+    assert clamp_path_mentions([finding], source) == [finding]
+
+
+def test_an_export_a_doc_names_by_path_keeps_its_confidence():
+    finding = _export("src/lib/api.ts", "helper")
+    source = {"docs/api.md": b"See src/lib/api.ts for the client.\n"}
+    assert clamp_path_mentions([finding], source) == [finding]
+    assert finding.confidence == 1.0
+
+
+def test_a_config_excluding_a_file_does_not_load_it():
+    config = "export default { test: { coverage: { exclude: ['src/legacy.ts'] } } }\n"
+    finding = _clamp("src/legacy.ts", {"vitest.config.ts": config})
+    assert finding.confidence == RISK_CAP_CONFIDENCE  # a mention, not a load
+
+
+def test_a_lint_config_ignoring_a_file_does_not_load_it():
+    config = "export default [{ ignores: ['src/old.ts'] }]\n"
+    assert not _dropped("src/old.ts", {"eslint.config.js": config})
+
+
+def test_a_config_comment_does_not_load_a_file():
+    config = "// removed ./src/gone.ts last release\nexport default { entry: ['src/index.ts'] }\n"
+    assert not _dropped("src/gone.ts", {"tsup.config.ts": config})
+    assert _dropped("src/index.ts", {"tsup.config.ts": config})
+
+
+def test_a_bundler_config_that_is_also_a_runner_still_needs_a_load_key(monkeypatch):
+    # A bundler config may count as a runner by name (a build file); a path it
+    # only mentions in a comment must still not be read as loaded.
+    from repowise.core.analysis.dead_code import name_occurrences
+
+    monkeypatch.setattr(name_occurrences, "is_runner_file", lambda path: True)
+    config = "// removed ./src/gone.ts last release\nexport default { entry: ['src/index.ts'] }\n"
+    assert not _dropped("src/gone.ts", {"tsup.config.ts": config})
+    assert _dropped("src/index.ts", {"tsup.config.ts": config})
+
+
+def test_a_config_passing_a_file_path_to_a_plugin_loads_it():
+    # repowise: packages/web/next.config.ts hands next-intl its request config.
+    config = 'const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");\n'
+    assert _dropped("packages/web/src/i18n/request.ts", {"packages/web/next.config.ts": config})
+
+
+def test_a_plugin_path_argument_needs_a_path_not_a_bare_word():
+    config = 'const plugin = makePlugin("request.ts");\n'
+    assert not _dropped("request.ts", {"next.config.ts": config})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        # A path computed into a variable the ignore list then uses.
+        'const legacy = path.resolve(__dirname, "src/old.ts");\n'
+        "export default [{ ignores: [legacy] }];\n",
+        'const files = glob.sync("src/old.ts");\n',
+        'const text = fs.readFileSync("src/old.ts", "utf8");\n',
+        'console.log("src/old.ts");\n',
+        'export default [globalIgnores(["src/old.ts"]), globalIgnores("src/old.ts")];\n',
+        # Nested: only the outer call is a config factory, neither is a plugin.
+        'export default defineConfig(resolve("src/old.ts"));\n',
+        "export default defineConfig({ ignores: [resolve('./src/old.ts')] });\n",
+        # A plugin's second argument, or a path it computes with, is not its file.
+        'export default somePlugin({}, "src/old.ts");\n',
+        'export default somePlugin(resolve("src/old.ts"));\n',
+        # Imported by require: an import edge answers that, not this rule.
+        'const old = require("./src/old.ts");\n',
+    ],
+)
+def test_a_path_a_config_only_computes_with_is_not_loaded(config):
+    for name in ("eslint.config.js", "next.config.ts"):
+        assert not _dropped("src/old.ts", {name: config})
+        finding = _export("src/old.ts", "default")
+        source = {name: config, "src/old.ts": "export default 1;\n"}
+        assert clamp_path_mentions([finding], {p: s.encode() for p, s in source.items()})
+
+
+def test_a_plugin_in_a_plugins_array_loads_its_path():
+    config = 'export default { plugins: [mdxPlugin("./src/mdx-components.tsx")] };\n'
+    assert _dropped("src/mdx-components.tsx", {"vite.config.ts": config})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "const note = \"somePlugin('./src/old.ts')\";\n",
+        "const note = 'somePlugin(\"./src/old.ts\")';\n",
+        "const note = `somePlugin('./src/old.ts')`;\n",
+    ],
+)
+def test_plugin_call_text_inside_a_string_is_not_a_load(config):
+    assert not _dropped("src/old.ts", {"next.config.ts": config})
+    # A real call after the literal still loads its file.
+    assert _dropped("src/old.ts", {"next.config.ts": config + 'somePlugin("./src/old.ts");\n'})
